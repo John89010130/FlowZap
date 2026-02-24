@@ -1,0 +1,43 @@
+# ============================
+# FlowZap — .gitignore
+# ============================
+
+# Segredos — NUNCA subir!
+.env
+.env.local
+.env.*
+!.env.example
+
+# Logs
+*.log
+console.log
+console_err.log
+error.log
+error2.log
+webhook.log
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# Backend logs e bancos locais
+src-backend/console.log
+src-backend/console_err.log
+src-backend/wa_history.db
+src-backend/wa_auth/
+src-backend/matched_files.txt
+
+# Build artifacts
+dist/
+build/
+*.zip
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# VS Code
+.vscode/
+*.code-workspace

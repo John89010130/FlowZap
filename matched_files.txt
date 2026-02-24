@@ -1,0 +1,12 @@
+C:\Users\TID-ERIC\Desktop\VisualCode\CopiaCRM\api-ponte.js
+C:\Users\TID-ERIC\Desktop\VisualCode\CopiaCRM\extension\background.js
+C:\Users\TID-ERIC\Desktop\VisualCode\CopiaCRM\extension\CHANGELOG.md
+C:\Users\TID-ERIC\Desktop\VisualCode\CopiaCRM\extension\manifest.json
+C:\Users\TID-ERIC\Desktop\VisualCode\CopiaCRM\extension\content\content.css
+C:\Users\TID-ERIC\Desktop\VisualCode\CopiaCRM\extension\content\content.js
+C:\Users\TID-ERIC\Desktop\VisualCode\CopiaCRM\extension\popup\popup.html
+C:\Users\TID-ERIC\Desktop\VisualCode\CopiaCRM\extension\popup\popup.js
+C:\Users\TID-ERIC\Desktop\VisualCode\CopiaCRM\src-backend\server.js
+C:\Users\TID-ERIC\Desktop\VisualCode\CopiaCRM\src-backend\webhook_server.js
+C:\Users\TID-ERIC\Desktop\VisualCode\CopiaCRM\supabase\functions\infinitepay-checkout\index.ts
+

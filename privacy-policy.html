@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Política de Privacidade — FlowZap</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'Segoe UI', system-ui, sans-serif; background: #f9fafb; color: #111827; }
+    header { background: linear-gradient(135deg, #00a884, #008069); color: white; padding: 48px 24px; text-align: center; }
+    header h1 { font-size: 2rem; font-weight: 700; }
+    header p { opacity: 0.85; margin-top: 8px; font-size: 1rem; }
+    main { max-width: 780px; margin: 0 auto; padding: 48px 24px; }
+    h2 { font-size: 1.2rem; font-weight: 600; color: #008069; margin: 32px 0 12px; }
+    p, li { font-size: 0.95rem; line-height: 1.7; color: #374151; }
+    ul { padding-left: 20px; margin-top: 8px; }
+    li { margin-bottom: 6px; }
+    .badge { display: inline-block; background: #d1fae5; color: #065f46; font-size: 0.75rem; font-weight: 700; padding: 2px 10px; border-radius: 99px; margin-bottom: 8px; }
+    footer { text-align: center; padding: 32px; color: #9ca3af; font-size: 0.85rem; border-top: 1px solid #e5e7eb; margin-top: 48px; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>⚡ FlowZap</h1>
+  <p>Política de Privacidade — Extensão para Chrome</p>
+</header>
+
+<main>
+  <p style="margin-bottom:24px;"><strong>Última atualização:</strong> 24 de fevereiro de 2025</p>
+
+  <p>A extensão <strong>FlowZap</strong> foi desenvolvida para uso pessoal e profissional no WhatsApp Web, com foco em organização de contatos, automação de atendimento e gestão de relacionamentos (CRM). Esta política explica como tratamos suas informações.</p>
+
+  <h2>1. Quais dados coletamos</h2>
+  <span class="badge">MÍNIMO NECESSÁRIO</span>
+  <ul>
+    <li><strong>E-mail e senha</strong> — usados exclusivamente para autenticação via Supabase (plataforma segura de backend).</li>
+    <li><strong>Dados do CRM</strong> — funis, campanhas, contatos e configurações são salvos localmente no seu navegador (<code>chrome.storage</code>) e na sua conta Supabase própria.</li>
+    <li><strong>Resumos de conversas</strong> — quando você usa a funcionalidade de relatórios IA, trechos de mensagens são enviados à API da OpenAI para geração do resumo. Nenhuma mensagem completa é armazenada por nós.</li>
+  </ul>
+
+  <h2>2. O que NÃO fazemos</h2>
+  <ul>
+    <li>❌ Não lemos, armazenamos ou transmitimos suas mensagens do WhatsApp para nossos servidores.</li>
+    <li>❌ Não compartilhamos seus dados com terceiros para fins comerciais.</li>
+    <li>❌ Não rastreamos sua navegação fora do domínio <code>web.whatsapp.com</code>.</li>
+    <li>❌ Não vendemos qualquer informação sua.</li>
+  </ul>
+
+  <h2>3. Permissões da extensão</h2>
+  <ul>
+    <li><strong>storage</strong> — salvar configurações e dados do CRM localmente.</li>
+    <li><strong>tabs</strong> — detectar quando você está no WhatsApp Web.</li>
+    <li><strong>notifications</strong> — exibir alertas de mensagens recebidas (quando ativado).</li>
+    <li><strong>scripting</strong> — injetar a interface do CRM dentro do WhatsApp Web.</li>
+  </ul>
+
+  <h2>4. Dados de terceiros</h2>
+  <p>A FlowZap integra com serviços externos de forma transparente:</p>
+  <ul>
+    <li><strong>Supabase</strong> — armazenamento seguro de conta e licença. <a href="https://supabase.com/privacy" target="_blank">Política de Privacidade da Supabase</a></li>
+    <li><strong>OpenAI</strong> — geração de resumos IA (somente quando você usa a funcionalidade de relatórios). <a href="https://openai.com/policies/privacy-policy" target="_blank">Política de Privacidade da OpenAI</a></li>
+  </ul>
+
+  <h2>5. Seus direitos</h2>
+  <p>Você pode a qualquer momento:</p>
+  <ul>
+    <li>Solicitar a exclusão de sua conta e dados associados.</li>
+    <li>Desinstalar a extensão — todos os dados locais são apagados automaticamente.</li>
+    <li>Exportar seus dados via a funcionalidade de backup integrada na extensão.</li>
+  </ul>
+
+  <h2>6. Contato</h2>
+  <p>Em caso de dúvidas sobre privacidade, entre em contato:</p>
+  <p style="margin-top:8px;"><strong>E-mail:</strong> suporte@flowzap.com.br</p>
+</main>
+
+<footer>
+  © 2025 FlowZap. Todos os direitos reservados.
+</footer>
+
+</body>
+</html>

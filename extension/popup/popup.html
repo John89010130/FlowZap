@@ -1,0 +1,258 @@
+﻿<!DOCTYPE html>
+<html lang="pt-BR">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FlowZap</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      width: 320px;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: #fff;
+      color: #111b21;
+    }
+
+    .header {
+      background: linear-gradient(135deg, #00a884, #007a61);
+      padding: 20px;
+      text-align: center;
+      color: white;
+    }
+
+    .logo {
+      width: 52px;
+      height: 52px;
+      background: rgba(255, 255, 255, 0.2);
+      border-radius: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: 0 auto 12px;
+      font-size: 26px;
+    }
+
+    .header h1 {
+      font-size: 18px;
+      font-weight: 700;
+    }
+
+    .header p {
+      font-size: 12px;
+      opacity: 0.85;
+      margin-top: 4px;
+    }
+
+    .version-badge {
+      display: inline-block;
+      background: rgba(255, 255, 255, 0.2);
+      border-radius: 10px;
+      padding: 2px 10px;
+      font-size: 11px;
+      margin-top: 6px;
+    }
+
+    .status-bar {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      padding: 10px 16px;
+      background: #f0fdf4;
+      border-bottom: 1px solid #e9edef;
+      font-size: 13px;
+      color: #065f46;
+      font-weight: 500;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #00a884;
+      animation: pulse 2s infinite;
+    }
+
+    @keyframes pulse {
+
+      0%,
+      100% {
+        opacity: 1;
+      }
+
+      50% {
+        opacity: 0.4;
+      }
+    }
+
+    .menu {
+      padding: 12px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+
+    .menu-item {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      padding: 14px 10px;
+      border-radius: 10px;
+      border: 1px solid #e9edef;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      text-decoration: none;
+      color: #111b21;
+      font-size: 12px;
+      font-weight: 500;
+      text-align: center;
+    }
+
+    .menu-item:hover {
+      background: #e7f8f5;
+      border-color: #00a884;
+      color: #00a884;
+      transform: translateY(-2px);
+      box-shadow: 0 4px 12px rgba(0, 168, 132, 0.15);
+    }
+
+    .menu-item .icon {
+      font-size: 22px;
+    }
+
+    .open-wa-btn {
+      display: block;
+      margin: 0 12px 12px;
+      padding: 12px;
+      background: linear-gradient(135deg, #00a884, #007a61);
+      color: white;
+      text-align: center;
+      border-radius: 10px;
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: 600;
+      border: none;
+      width: calc(100% - 24px);
+      transition: all 0.2s ease;
+    }
+
+    .open-wa-btn:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 4px 14px rgba(0, 168, 132, 0.4);
+    }
+
+    .footer {
+      padding: 10px 16px;
+      border-top: 1px solid #e9edef;
+      display: flex;
+      justify-content: space-between;
+      font-size: 11px;
+      color: #667781;
+    }
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 0;
+      border-top: 1px solid #e9edef;
+      border-bottom: 1px solid #e9edef;
+      margin: 0 0 8px;
+    }
+
+    .stat {
+      text-align: center;
+      padding: 12px 8px;
+      border-right: 1px solid #e9edef;
+    }
+
+    .stat:last-child {
+      border-right: none;
+    }
+
+    .stat-val {
+      font-size: 20px;
+      font-weight: 700;
+      color: #00a884;
+    }
+
+    .stat-lbl {
+      font-size: 10px;
+      color: #667781;
+      margin-top: 2px;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="header">
+    <div class="logo">🚀</div>
+    <h1>FlowZap</h1>
+    <p>CRM Completo para WhatsApp</p>
+    <span class="version-badge">v1.0.0</span>
+  </div>
+
+  <div class="status-bar">
+    <div class="status-dot"></div>
+    <span>Extensão Ativa</span>
+  </div>
+
+  <div class="stats">
+    <div class="stat">
+      <div class="stat-val" id="stat-funis">0</div>
+      <div class="stat-lbl">No Funil</div>
+    </div>
+    <div class="stat">
+      <div class="stat-val" id="stat-camp">0</div>
+      <div class="stat-lbl">Campanhas</div>
+    </div>
+    <div class="stat">
+      <div class="stat-val" id="stat-bot">0</div>
+      <div class="stat-lbl">Bots Ativos</div>
+    </div>
+  </div>
+
+  <div class="menu">
+    <div class="menu-item" id="btn-dashboard">
+      <span class="icon">📊</span>Dashboard
+    </div>
+    <div class="menu-item" id="btn-funis">
+      <span class="icon">🎯</span>Funis CRM
+    </div>
+    <div class="menu-item" id="btn-campanhas">
+      <span class="icon">✉️</span>Campanhas
+    </div>
+    <div class="menu-item" id="btn-bot">
+      <span class="icon">🤖</span>Auto Atendimento
+    </div>
+    <div class="menu-item" id="btn-relatorios">
+      <span class="icon">📊</span>Relatórios
+    </div>
+    <div class="menu-item" id="btn-cal">
+      <span class="icon">📅</span>Calendário
+    </div>
+    <div class="menu-item" id="btn-cfg">
+      <span class="icon">⚙️</span>Configurações
+    </div>
+  </div>
+
+  <button class="open-wa-btn" id="btn-open-wa">
+    📱 Abrir WhatsApp Web
+  </button>
+
+  <div class="footer">
+    <span>FlowZap by TID Software</span>
+    <span>v1.0.0</span>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+
+</html>
