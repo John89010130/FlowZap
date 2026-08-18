@@ -1,4 +1,12 @@
-﻿# FlowZap - Histórico de Versões
+# FlowZap - Histórico de Versões
+
+## v1.2.4 (2026-08-13)
+### Novidades e Correções:
+- **Tratamento de Rate Limit (HTTP 429):** Leitura nativa de erros GoTrue Auth do Supabase com alerta amigável de segurança.
+- **Prevenção de Duplo Clique:** Desabilitação dinâmica dos botões "Criar Conta" e "Fazer Login" durante envio de requisições.
+- **Recuperação de Senha:** Opção "Esqueceu a senha?" na tela de Login e tela integrada de redefinição de senha via token de e-mail (`showResetPasswordScreen`).
+
+---
 
 ## v1.0.3 (2026-02-21)
 ### Novidades:

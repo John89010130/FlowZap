@@ -1,0 +1,234 @@
+﻿diff --git a/src-backend/whatsapp_service.js b/src-backend/whatsapp_service.js
+index 8bb3e99..3139900 100644
+--- a/src-backend/whatsapp_service.js
++++ b/src-backend/whatsapp_service.js
+@@ -16,7 +16,6 @@ if (process.env.OPENAI_API_KEY) {
+     openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+ }
+ 
+-// Inicializa o banco SQLite local para guardar o backup bruto
+ let dbPromise = open({
+     filename: path.join(__dirname, 'wa_history.db'),
+     driver: sqlite3.Database
+@@ -30,6 +29,14 @@ let dbPromise = open({
+             text_content TEXT
+         );
+         CREATE INDEX IF NOT EXISTS idx_jid ON messages(jid);
++
++        CREATE TABLE IF NOT EXISTS ai_analysis_log (
++            jid TEXT NOT NULL,
++            date_str TEXT NOT NULL,
++            msg_count INTEGER NOT NULL,
++            ai_json TEXT NOT NULL,
++            PRIMARY KEY (jid, date_str)
++        );
+     `);
+     return db;
+ });
+@@ -66,12 +73,18 @@ async function saveMessageToLocalDB(msg) {
+     }
+ }
+ 
+-async function startSession(sessionId) {
+-    if (sessions.has(sessionId)) return sessions.get(sessionId);
++async function startSession(sessionId, isReconnecting = false) {
++    let sessionData = sessions.get(sessionId);
++
++    // Se n├úo for reconex├úo interna e j├í tiver socket, n├úo recria
++    if (!isReconnecting && sessionData && sessionData.sock) {
++        return sessionData;
++    }
+ 
+-    // Reserva a sess├úo na mem├│ria com status INITIALIZING para que os pings n├úo achem que est├í offline
+-    const sessionData = { sock: null, qrBase64: null, status: 'INITIALIZING', isSyncing: false };
+-    sessions.set(sessionId, sessionData);
++    if (!sessionData) {
++        sessionData = { sock: null, qrBase64: null, status: 'INITIALIZING', isSyncing: false };
++        sessions.set(sessionId, sessionData);
++    }
+ 
+     const sessionDir = path.join(authFolder, sessionId);
+     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+@@ -82,7 +95,7 @@ async function startSession(sessionId) {
+         auth: state,
+         logger: pino({ level: 'error' }),
+         printQRInTerminal: false,
+-        syncFullHistory: false, // Historicos GIGANTES fazem o celular falhar ("N├úo foi poss├¡vel concluir a sincroniza├º├úo")
++        syncFullHistory: false, // OBRIGAT├ôRIO SER FALSE: Se for true o WhatsApp flag as spam e d├í "device_removed" (401)
+         markOnlineOnConnect: false, // Menos intrusivo
+     });
+ 
+@@ -107,11 +120,11 @@ async function startSession(sessionId) {
+             console.log(`[WA Baileys] Terminou bloco final de sync hist├│rico.`);
+             sessionData.isSyncing = false;
+         } else {
+-            // Se o celular abortar a nuvem ou demorar mais de 15s pra mandar o pr├│x bloco, consideramos finalizado pacientemente.
++            // Aumentamos o limite para 60 segundos porque 515 (stream error delay) causa reconex├Áes do Baileys
+             syncTimeout = setTimeout(() => {
+-                console.log(`[WA Baileys] Tempo esgotado para nova remessa. Abortando Sincroniza├º├úo graciosamente.`);
++                console.log(`[WA Baileys] Tempo esgotado (60s) para nova remessa. Abortando Sincroniza├º├úo graciosamente.`);
+                 sessionData.isSyncing = false;
+-            }, 15000);
++            }, 60000);
+         }
+     });
+ 
+@@ -129,15 +142,25 @@ async function startSession(sessionId) {
+         }
+ 
+         if (connection === 'close') {
+-            const shouldReconnect = (lastDisconnect.error)?.output?.statusCode !== DisconnectReason.loggedOut;
+-            sessionData.status = 'DISCONNECTED';
+-            sessionData.qrBase64 = null;
++            const statusCode = lastDisconnect?.error?.output?.statusCode;
++            // Se o code for 401 (loggedOut) ou tiver device_removed na string, a gente desconecta pra valer
++            const errStr = String(lastDisconnect?.error || '');
++            const isLoggedOut = statusCode === DisconnectReason.loggedOut || errStr.includes('401') || errStr.includes('device_removed');
++            const shouldReconnect = !isLoggedOut;
++
+             if (!shouldReconnect) {
++                console.log('[WA Baileys] Sess├úo Desconectada permanentemente (Device Removed / Logged Out).');
++                sessionData.status = 'DISCONNECTED';
++                sessionData.qrBase64 = null;
+                 fs.rmSync(sessionDir, { recursive: true, force: true });
+                 sessions.delete(sessionId);
+             } else {
+-                sessions.delete(sessionId);
+-                setTimeout(() => startSession(sessionId), 3000);
++                console.log(`[WA Baileys] Conex├úo caiu (Stream Error: ${statusCode || errStr}). Reconectando silenciosamente...`);
++                // IMPORTANTE: N├úo mude o status para 'DISCONNECTED', sen├úo o frontend aborta tudo!
++                sessionData.status = 'RECONNECTING';
++                sessionData.qrBase64 = null;
++                // N├úo deleta a sess├úo da mem├│ria para manter o state.isSyncing intacto enquanto reconecta!
++                setTimeout(() => startSession(sessionId, true), 3000);
+             }
+         } else if (connection === 'open') {
+             sessionData.status = 'CONNECTED';
+@@ -219,7 +242,7 @@ async function fetchAndAnalyzeHistory(sessionId, contactPhoneOrJid, dataIni, dat
+ /**
+  * Puxa hist├│rico DE TODOS os JIDs do SQLite local no per├¡odo e pede a OpenAI para relatar tudo!
+  */
+-async function fetchAndAnalyzeAllHistory(sessionId, dataIni, dataFim, onProgress = null) {
++async function fetchAndAnalyzeAllHistory(sessionId, dataIni, dataFim, isForceUpdate = false, onProgress = null) {
+     if (!openai && process.env.OPENAI_API_KEY) {
+         openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+     }
+@@ -263,35 +286,77 @@ async function fetchAndAnalyzeAllHistory(sessionId, dataIni, dataFim, onProgress
+         const msgs = grouped[jid];
+         const isGroup = jid.includes('@g.us');
+ 
+-        // Formata as mensagens daquele cliente X
+-        const rawText = msgs.map(h => {
+-            const dateStr = new Date(h.timestamp).toISOString();
+-            let origin = 'Cliente';
+-            if (h.sender === 'ME') {
+-                origin = 'Eu (Atendente)';
+-            } else if (isGroup) {
+-                origin = `Membro do Grupo (${h.sender.split('@')[0]})`;
++        // Agrupar mensagens deste JID por data local (Assumindo GMT-3)
++        const msgsByDate = {};
++        msgs.forEach(h => {
++            const dateStr = new Date(h.timestamp - 3 * 60 * 60 * 1000).toISOString().slice(0, 10);
++            if (!msgsByDate[dateStr]) msgsByDate[dateStr] = [];
++            msgsByDate[dateStr].push(h);
++        });
++
++        const sortedDates = Object.keys(msgsByDate).sort();
++        const datesToAnalyze = [];
++        const cachedResults = [];
++
++        // Checar quais dias podemos reusar do banco local
++        for (const dateStr of sortedDates) {
++            const dayMsgs = msgsByDate[dateStr];
++
++            if (!isForceUpdate) {
++                const cachedRow = await db.get(`SELECT msg_count, ai_json FROM ai_analysis_log WHERE jid = ? AND date_str = ?`, [jid, dateStr]);
++                if (cachedRow && cachedRow.msg_count === dayMsgs.length) {
++                    try {
++                        const parsed = JSON.parse(cachedRow.ai_json);
++                        cachedResults.push(parsed);
++                        console.log(`[Cache OK] ${jid} - ${dateStr} (Ignorado IA)`);
++                        continue;
++                    } catch (e) { }
++                }
+             }
+-            return `[${dateStr}] ${origin}: ${h.text_content}`;
++            datesToAnalyze.push(dateStr);
++        }
++
++        // Se todas as datas deste cliente j├í estiverem processadas e o n├║mero de mensagens for id├¬ntico
++        if (datesToAnalyze.length === 0) {
++            finalResults.push(...cachedResults);
++            continue;
++        }
++
++        // Formata as mensagens SOMENTE das datas que precisam de an├ílise
++        const rawText = datesToAnalyze.map(dateStr => {
++            return msgsByDate[dateStr].map(h => {
++                const dtStr = new Date(h.timestamp).toISOString();
++                let origin = 'Cliente';
++                if (h.sender === 'ME') {
++                    origin = 'Eu (Atendente)';
++                } else if (isGroup) {
++                    origin = `Membro do Grupo (${h.sender.split('@')[0]})`;
++                }
++                return `[${dtStr}] ${origin}: ${h.text_content}`;
++            }).join('\n');
+         }).join('\n');
+ 
+         const prompt = `
+-        Abaixo, voc├¬ tem um hist├│rico de conversa bruta originada de ${isGroup ? 'um GRUPO de WhatsApp' : 'um CONTATO/CLIENTE de WhatsApp'}.
+-        O identificador do chat ├®: "${jid.split('@')[0]}"
+-        Sua miss├úo ├® gerar um array de objetos JSON que represente o dia-a-dia da conversa. O Array n├úo pode estar contido em objeto raiz.
++        Abaixo, voc├¬ tem um hist├│rico de conversa bruta originada de ${isGroup ? 'um GRUPO de WhatsApp' : 'um CONTATO/CLIENTE individual de WhatsApp'}.
++        O identificador t├®cnico deste chat ├®: "${jid.split('@')[0]}"
++        Sua miss├úo ├® atuar como um analista de qualidade CRM e gerar um array de objetos JSON que represente um relat├│rio anal├¡tico do atendimento, separado por dias. O Array n├úo pode estar contido em objeto raiz.
+         Cada objeto deve obrigatoriamente ter:
+           - "date": String no formato YYYY-MM-DD daquelas mensagens.
+           - "contato": ${isGroup
+-                ? `Tente DESCOBRIR O NOME DESSE GRUPO pelo contexto das mensagens. Se descobrir o nome real, escreva-o e adicione (Grupo). Se for imposs├¡vel achar o nome no meio da conversa, devolva apenas "Grupo ${jid.split('@')[0]}".`
+-                : `Tente DESCOBRIR O NOME DA PESSOA lendo as mensagens (seja porque o atendente a chamou pelo nome ou ela mesma se apresentou). Se achar, devolva apenas o Nome Real com a primeira letra mai├║scula (ex: "Carlos"). Somente se for IMPOSS├ìVEL achar qualquer nome no texto inteiro, devolva o telefone original "${jid.split('@')[0]}".`
++                ? `Analise o contexto das mensagens para TENTAR DESCOBRIR O NOME REAL DO GRUPO. Se descobrir o nome, escreva-o seguido da tag "(Grupo)". Se for imposs├¡vel achar o nome no meio da conversa, devolva apenas "Grupo ${jid.split('@')[0]}".`
++                : `Analise ativamente as mensagens para DESCOBRIR O NOME DA PESSOA com quem a empresa est├í falando (ex: o atendente chamou o cliente pelo nome ou a pessoa se identificou/apresentou). Se achar, devolva apenas o Nome Real (ex: "Carlos Daniel"). Somente se for IMPOSS├ìVEL achar qualquer nome no texto, devolva o telefone original "${jid.split('@')[0]}".`
+             }
+-          - "numMensagens": Inteiro representando o n├║mero de bal├Áes de mensagens lidos nesse dia.
+-          - "horaInicio": String no formato HH:MM (ex: "10:00") correspondente ao hor├írio da PRIMEIRA mensagem deste dia.
+-          - "horaFim": String no formato HH:MM (ex: "17:30") correspondente ao hor├írio da ├ÜLTIMA mensagem deste dia.
+-          - "ultimaMensagem": Responda OBRIGATORIAMENTE um resumo de 10-40 palavras sobre os principais assuntos negociados/tratados no dia. OBRIGATORIAMENTE inicie o texto deste resumo citando quem estava na conversa no formato "Participantes: [nome das pessoas ou n├║meros] - " seguido do resumo.
+-        Apenas me devolva o JSON bruto do array.
++          - "numMensagens": Inteiro representando o n├║mero de bal├Áes de mensagens movimentados nesse dia.
++          - "horaInicio": String no formato HH:MM correspondente ao hor├írio da primeira mensagem.
++          - "horaFim": String no formato HH:MM correspondente ao hor├írio da ├║ltima mensagem.
++          - "ultimaMensagem": Analise profundamente o teor da conversa deste dia e gere um **detalhado relato profissional (de 2 a 5 frases)**. O seu relato DEVE obrigatoriamente conter:
++             1. A clareza de DE QUEM para QUEM foi a conversa (Identifique os reais participantes presentes neste dia).
++             2. O QUE motivou a conversa: Quais foram as d├║vidas levantadas, o produto/servi├ºo solicitado ou a negocia├º├úo abordada.
++             3. COMO o atendimento foi conduzido, informando o tom, o desfecho do dia, e quais os pr├│ximos passos ou pend├¬ncias combinadas.
++             Inicie OBRIGATORIAMENTE este campo no formato: "Participantes identificados: [Nome das pessoas envolvidas] - [Relato detalhado...]".
++        Deixe o JSON perfeito para \`JSON.parse()\`. Devolva APENAS O JSON BRUTO em array, n├úo inclua marca├º├úo markdown como "\`\`\`json".
+         
+-        Conversa:
++        Conte├║do da Conversa Transcrita:
+         ${rawText}
+         `;
+ 
+@@ -309,7 +374,19 @@ async function fetchAndAnalyzeAllHistory(sessionId, dataIni, dataFim, onProgress
+ 
+             const parsedJson = JSON.parse(content);
+             if (Array.isArray(parsedJson)) {
+-                finalResults.push(...parsedJson);
++                // Junta cache + O que veio novo da IA
++                finalResults.push(...cachedResults, ...parsedJson);
++
++                // Salva o que a IA acabou de responder no SQLite (Cache local)
++                for (const item of parsedJson) {
++                    const itemDate = item.date;
++                    if (itemDate && msgsByDate[itemDate]) {
++                        await db.run(
++                            `INSERT OR REPLACE INTO ai_analysis_log (jid, date_str, msg_count, ai_json) VALUES (?, ?, ?, ?)`,
++                            [jid, itemDate, msgsByDate[itemDate].length, JSON.stringify(item)]
++                        );
++                    }
++                }
+             }
+         } catch (e) {
+             console.error(`Erro OpenAI p/ ${jid}:`, e.message);

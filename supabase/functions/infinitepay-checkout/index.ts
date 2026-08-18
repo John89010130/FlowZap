@@ -26,7 +26,7 @@ serve(async (req) => {
         const isApiUnlocked = amount >= 50
         const priceInCents = Math.round(amount * 100)
 
-        if (priceInCents < 500) throw new Error('Valor mínimo é R$ 5,00')
+        if (priceInCents < 1000) throw new Error('Valor mínimo é R$ 10,00')
 
         const handle = Deno.env.get('INFINITEPAY_HANDLE')
         if (!handle) throw new Error('INFINITEPAY_HANDLE ausente nos Secrets do Supabase')

@@ -52,3 +52,28 @@ CREATE TABLE IF NOT EXISTS public.webhook_logs (
 
 -- Desabilitar RLS na tabela de logs (service role precisa escrever)
 ALTER TABLE public.webhook_logs DISABLE ROW LEVEL SECURITY;
+
+-- 7. Trigger para criar licença Trial de 3 dias automaticamente ao criar usuário no Supabase Auth
+CREATE OR REPLACE FUNCTION public.handle_new_user_license()
+RETURNS TRIGGER AS $$
+BEGIN
+  INSERT INTO public.licenses (user_id, email, plan_expires_at, amount_paid, api_enabled)
+  VALUES (
+    NEW.id,
+    NEW.email,
+    NOW() + INTERVAL '3 days',
+    0,
+    false
+  )
+  ON CONFLICT (email) DO UPDATE SET
+    user_id = EXCLUDED.user_id;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Trigger disparado automaticamente após cadastrar usuário na tabela auth.users
+DROP TRIGGER IF EXISTS on_auth_user_created_license ON auth.users;
+CREATE TRIGGER on_auth_user_created_license
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE FUNCTION public.handle_new_user_license();
+

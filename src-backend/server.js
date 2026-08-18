@@ -2,10 +2,18 @@
 // FlowZap — Servidor Local Unificado de Pagamentos (Checkout + Webhook)
 // Roda na porta 3001 — A extensão e a InfinityPay comunicam com ele.
 // ==========================================================================
-require('dotenv').config();
+require('dotenv').config({ path: require('path').join(__dirname, '.env') });
 const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
+
+// Previne fechamento brusco em erros não tratados
+process.on('uncaughtException', (err) => {
+    console.error('❌ Erro Não Tratado (Uncaught Exception):', err);
+});
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('❌ Promessa Rejeitada (Unhandled Rejection):', reason);
+});
 
 const app = express();
 app.use(cors());
@@ -42,7 +50,7 @@ app.post('/api/checkout', async (req, res) => {
         if (authErr || !user) return res.status(401).json({ error: 'Token inválido' });
 
         const amount = parseInt(req.body.amount, 10);
-        if (!amount || amount < 5) return res.status(400).json({ error: 'Valor mínimo R$ 5,00' });
+        if (!amount || amount < 10) return res.status(400).json({ error: 'Valor mínimo R$ 10,00' });
 
         const priceInCents = amount * 100;
         const isApiTier = amount >= 50;
@@ -243,6 +251,17 @@ app.get('/api/wa/status', (req, res) => {
     res.json(waService.getStatus(session));
 });
 
+// ROTA DIAGNÓSTICO — conta mensagens no SQLite por período
+app.get('/api/wa/db-stats', async (req, res) => {
+    try {
+        const { dataIni, dataFim } = req.query;
+        const stats = await waService.getDbStats(dataIni, dataFim);
+        res.json(stats);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 app.post('/api/wa/connect', async (req, res) => {
     const { session } = req.body;
     if (!session) return res.status(400).json({ error: 'Sessão não informada' });
@@ -272,10 +291,12 @@ app.post('/api/wa/import-history', async (req, res) => {
 });
 
 app.get('/api/wa/import-history-stream', async (req, res) => {
-    const { session, dataIni, dataFim } = req.query;
+    const { session, dataIni, dataFim, force } = req.query;
     if (!session || !dataIni || !dataFim) {
         return res.status(400).json({ error: 'Parâmetros incompletos (session, dataIni, dataFim)' });
     }
+
+    const isForceUpdate = force === 'true';
 
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
@@ -284,15 +305,27 @@ app.get('/api/wa/import-history-stream', async (req, res) => {
     res.flushHeaders();
 
     try {
-        console.log(`[WA] Extraindo TODO o histórico STREAM | Período: ${dataIni} -> ${dataFim}`);
+        console.log(`[WA] Extraindo TODO o histórico STREAM | Período: ${dataIni} -> ${dataFim} | Force: ${isForceUpdate}`);
 
-        const result = await waService.fetchAndAnalyzeAllHistory(session, dataIni, dataFim, (current, total, jid) => {
+        const result = await waService.fetchAndAnalyzeAllHistory(session, dataIni, dataFim, isForceUpdate, (current, total, jid) => {
             // Emite progresso de cada cliente processado
             res.write(`data: ${JSON.stringify({ type: 'progress', current, total, jid })}\n\n`);
         });
 
         // Quando termina o loop da IA, emite o grande final
-        res.write(`data: ${JSON.stringify({ type: 'end', data: result.data || result })}\n\n`);
+        let finalArray = [];
+        if (result.success && Array.isArray(result.data)) {
+            finalArray = result.data;
+        } else if (Array.isArray(result)) {
+            finalArray = result;
+        }
+
+        // Se não achou mensagens, envia diagnóstico para o frontend
+        if (!result.success) {
+            res.write(`data: ${JSON.stringify({ type: 'error', error: result.error || 'Nenhuma mensagem no banco local para o período selecionado. Verifique se o Baileys sincronizou o histórico.' })}\n\n`);
+        } else {
+            res.write(`data: ${JSON.stringify({ type: 'end', data: finalArray })}\n\n`);
+        }
     } catch (e) {
         console.error('Erro /import-history-stream:', e);
         res.write(`data: ${JSON.stringify({ type: 'error', error: e.message })}\n\n`);
@@ -358,3 +391,6 @@ app.listen(PORT, () => {
     console.log(`   POST /api/wa/import-history-all    → Baileys + OpenAI: Extrai TUDO em lote`);
     console.log(`   POST /api/wa/send                  → Baileys: Dispara Nova Mensagem\n`);
 });
+
+// Força o processo a ficar vivo caso o loop de eventos do Windows tente encerrar prematuramente
+setInterval(() => { }, 10000);

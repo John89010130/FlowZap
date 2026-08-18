@@ -1,11 +1,11 @@
-﻿// FlowZap - Content Script
-// Versão: 1.2.0
-// Changelog: v1.2.0 - Kanban de Conversas Reais do WhatsApp. Importação, drag&drop, auto-captura, navegação.
+// FlowZap - Content Script
+// Versão: 1.3.0
+// Changelog: v1.3.0 - Motor de regras Kanban reescrito, exportação XLSX nativa, fuso Brasília, Kanban expandido por padrão.
 
 (function () {
   'use strict';
 
-  const CRM_VERSION = '1.2.0';
+  const CRM_VERSION = '1.3.0';
   const SIDEBAR_W = 55; // largura em px da sidebar FlowZap (deve ser igual ao --crm-sidebar-width do CSS)
 
   if (document.getElementById('FlowZap-sidebar')) return;
@@ -421,6 +421,10 @@
           <button id="rel-btn-excel" style="background:#217346;color:#fff;border:none;padding:9px 10px;border-radius:4px;cursor:pointer;white-space:nowrap;" title="Exportar tabela para Excel / CSV">📊 Excel</button>
         </div>
       </div>
+      <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--crm-text-secondary);margin-bottom:12px;cursor:pointer;">
+        <input type="checkbox" id="rel-chk-force" style="accent-color:var(--crm-primary);">
+        Forçar reanálise completa (Apaga o histórico local daquele período e recria tudo)
+      </label>
       <div id="rel-status" style="font-size:12px;color:var(--crm-text-secondary);min-height:18px;margin-bottom:8px;"></div>
       <div style="overflow-x:auto;">
         <table style="width:100%;border-collapse:collapse;color:var(--crm-text);text-align:left;font-size:13px;">
@@ -551,7 +555,7 @@
       return { mapped };
     }
 
-    async function persistRecord(contactName, dateStr, joinedMessages, msgCount, horaInicio = '', horaFim = '') {
+    async function persistRecord(contactName, dateStr, joinedMessages, msgCount, horaInicio = '', horaFim = '', forceOverwrite = false) {
       if (!state.data.atendimentos) state.data.atendimentos = [];
 
       const existingIdx = state.data.atendimentos.findIndex(a => a.date === dateStr && a.contato === contactName);
@@ -564,7 +568,9 @@
         const ex = state.data.atendimentos[existingIdx];
 
         let shouldUpdate = false;
-        if (isImportedDefault(ex.ultimaMensagem) && !isImportedDefault(cleanIncoming)) {
+        if (forceOverwrite) {
+          shouldUpdate = true; // Sempre reescreve o resumo velho pelo novo da IA
+        } else if (isImportedDefault(ex.ultimaMensagem) && !isImportedDefault(cleanIncoming)) {
           // Tinha registro vazio, achamos novas mensagens
           shouldUpdate = true;
         } else if (!isImportedDefault(cleanIncoming) && cleanIncoming !== ex.ultimaMensagem) {
@@ -776,7 +782,7 @@
                 await sleep(3000);
                 const cRes = await fetch(`${backendUrl}/status?session=${userJidPhone}`);
                 const cData = await cRes.json();
-                if (!cData.isSyncing) break; // Terminou de baixar e salvar a db
+                if (!cData.isSyncing && cData.status !== 'INITIALIZING') break; // Terminou de baixar e salvar a db (ou desconectou)
               }
               prog.log(`✅ Banco de dados Puxado com sucesso!`, '#00a884');
             } else {
@@ -796,29 +802,68 @@
           poolCount++;
         }
 
+        const forceUpdate = document.getElementById('rel-chk-force')?.checked || false;
+
         if (prog.isCancelled() || !isConnected) {
           prog.finish('🚫 Conexão cancelada ou não realizada a tempo.', true);
           return;
         }
 
-        // APAGAR RELATÓRIOS ANTIGOS DO PERÍODO
-        if (state.data && state.data.atendimentos) {
-          const sizeBefore = state.data.atendimentos.length;
-          state.data.atendimentos = state.data.atendimentos.filter(a => {
-            return a.date < ini || a.date > fim;
-          });
-          const removed = sizeBefore - state.data.atendimentos.length;
-          if (removed > 0) {
-            prog.log(`🗑️ Limpados ${removed} relatórios antigos dentro desse período de datas para abrir espaço.`);
-            saveData();
+        if (forceUpdate) {
+          prog.log(`⚠️ Modo Forçado: Apagando todos os resumos do período (${ini} até ${fim})...`, '#ef4444');
+
+          if (state.data && state.data.atendimentos) {
+            const sizeBefore = state.data.atendimentos.length;
+            state.data.atendimentos = state.data.atendimentos.filter(a => a.date < ini || a.date > fim);
+            const removed = sizeBefore - state.data.atendimentos.length;
+
+            if (removed > 0) {
+              prog.log(`🗑️ Limpados ${removed} relatórios antigos. (Recriando do zero)`, '#8b5cf6');
+              saveData();
+
+              // Apagar do Supabase também para não dar duplicidade
+              const uuid = await new Promise(r => chrome.storage.local.get('sb_uid', d => r(d.sb_uid)));
+              const sbtk = await new Promise(r => chrome.storage.local.get('sb_token', d => r(d.sb_token)));
+              if (uuid && sbtk) {
+                try {
+                  await fetch(`${SUPA_URL}/rest/v1/crm_atendimentos?user_id=eq.${uuid}&date=gte.${ini}&date=lte.${fim}`, {
+                    method: 'DELETE',
+                    headers: { 'apikey': SUPA_ANON, 'Authorization': `Bearer ${sbtk}` }
+                  });
+                  prog.log(`☁️ Supabase limpo com sucesso para essas datas!`, '#00a884');
+                } catch (e) { }
+              }
+            }
           }
+        } else {
+          prog.log(`⏭️ Modo Atualização (Ignorando conversas que não tiveram novas mensagens)`, '#0ea5e9');
         }
+
+        // Diagnóstico: verifica quantas mensagens há no banco antes de chamar a IA
+        try {
+          const statsRes = await fetch(`${backendUrl}/db-stats?dataIni=${ini}&dataFim=${fim}`);
+          if (statsRes.ok) {
+            const stats = await statsRes.json();
+            if (stats.totalMessages === 0) {
+              prog.finish(`❌ Banco vazio! O Baileys ainda não sincronizou mensagens. Tente desconectar e reconectar para forçar um novo sync.`, true);
+              prog.log(`📁 Banco em: ${stats.dbPath}`, '#667781');
+              return;
+            }
+            if (stats.inSelectedPeriod === 0) {
+              const oldest = stats.dateRange?.oldest ? new Date(stats.dateRange.oldest).toLocaleDateString('pt-BR') : '?';
+              const newest = stats.dateRange?.newest ? new Date(stats.dateRange.newest).toLocaleDateString('pt-BR') : '?';
+              prog.finish(`❌ 0 mensagens no período ${ini} → ${fim}. O banco tem ${stats.totalMessages} msgs de ${oldest} até ${newest}.`, true);
+              return;
+            }
+            prog.log(`📊 Banco OK: ${stats.inSelectedPeriod} msgs no período (${stats.totalMessages} total, ${stats.topContacts?.length || 0} contatos)`, '#00a884');
+          }
+        } catch (_) { /* silencioso se o endpoint não existe */ }
 
         // Envia comando para que o Backend faça todo o massivo processamento OpenAI (MODO STREAM)
         prog.update(50, 'Enviando histórico para o ChatGPT...');
         prog.log(`🧠 Inteligência Artificial analisando ${ini} até ${fim}...`, '#6366f1');
 
-        const streamUrl = `${backendUrl}/import-history-stream?session=${userJidPhone}&dataIni=${ini}&dataFim=${fim}`;
+        const streamUrl = `${backendUrl}/import-history-stream?session=${userJidPhone}&dataIni=${ini}&dataFim=${fim}&force=${forceUpdate}`;
         const eventSource = new EventSource(streamUrl);
 
         eventSource.onmessage = async (event) => {
@@ -833,7 +878,11 @@
             }
             else if (msg.type === 'end') {
               eventSource.close();
-              const arrayData = msg.data || [];
+              // Garante que arrayData é sempre um array iterável, mesmo que a IA retorne objeto ou dado inesperado
+              let arrayData = msg.data;
+              if (!Array.isArray(arrayData)) {
+                arrayData = (arrayData && typeof arrayData === 'object') ? Object.values(arrayData) : [];
+              }
 
               if (arrayData.length === 0) {
                 prog.finish('Nenhuma conversa encontrada neste limite de datas.', true);
@@ -843,22 +892,35 @@
               prog.update(90, 'Salvando Json de Alta Qualidade Localmente...');
               let savedCount = 0;
 
+              // Debug: mostra os primeiros itens recebidos no console
+              console.log(`[FlowZap IA] Recebidos ${arrayData.length} items da IA:`, arrayData.slice(0, 3));
+
               for (const item of arrayData) {
-                if (item.date && item.contato && item.ultimaMensagem) {
+                // Aceita 'ultimaMensagem' OU 'ultima_mensagem_resumo' (compatibilidade com variação da IA)
+                const resumo = item.ultimaMensagem || item.ultima_mensagem_resumo || item.resumo || '';
+                const contato = item.contato || item.contact || item.jid || '';
+                const date = item.date || item.data || '';
+                if (date && contato && resumo) {
                   const ok = await persistRecord(
-                    item.contato,
-                    item.date,
-                    item.ultimaMensagem,
-                    item.numMensagens || 1,
-                    item.horaInicio || '',
-                    item.horaFim || ''
+                    contato,
+                    date,
+                    resumo,
+                    item.numMensagens || item.num_mensagens || 1,
+                    item.horaInicio || item.hora_inicio || '',
+                    item.horaFim || item.hora_fim || '',
+                    forceUpdate
                   );
                   if (ok) savedCount++;
+                } else {
+                  console.warn('[FlowZap IA] Item ignorado (campos faltando):', item);
                 }
               }
 
               saveData(); // Save after all records are processed
               prog.update(100, `Finalizado! ${savedCount} registros de IA salvos.`);
+              if (savedCount === 0 && arrayData.length > 0) {
+                prog.log(`⚠️ A IA retornou ${arrayData.length} itens mas nenhum tinha os campos obrigatórios. Verifique o console (F12) para detalhes.`, '#f59e0b');
+              }
               prog.log(`🎉 Sucesso Absoluto!`, '#00a884');
               prog.finish(`Concluído! ${savedCount} chats IA processados.`);
 
@@ -885,29 +947,192 @@
     }
 
     // ── Exportar para XLSX (Verdadeiro via Backend) ───────────────────────────
-    async function exportarExcel() {
+    function exportarExcel() {
+      const funil = getFunil();
+      const colOptions = funil.colunas.map((colObj, idx) => {
+        const c = _normCol(colObj);
+        return `<label style="display:flex;align-items:center;gap:6px;margin-bottom:8px;font-size:14px;cursor:pointer;"><input type="checkbox" class="rel-col-chk" value="${idx}" checked style="accent-color:var(--crm-primary);"> ${c.nome}</label>`;
+      }).join('');
+
+      const mId = 'crm-excel-modal';
+      makeModal(mId, '📊 Filtro de Exportação');
+      const b = document.getElementById(mId + '-body');
+      b.innerHTML = `
+        <div style="margin-bottom:12px;color:var(--crm-text-secondary);font-size:13px;">Quais status do funil de vendas (Kanban) você deseja exportar? Contatos que não estão nas colunas selecionadas serão ocultados do Excel.</div>
+        <div style="background:var(--crm-bg-light);padding:12px;border-radius:6px;border:1px solid var(--crm-border);max-height:260px;overflow-y:auto;color:var(--crm-text);margin-bottom:10px;">
+          ${colOptions}
+        </div>
+      `;
+      const ftr = document.getElementById(mId + '-footer');
+      ftr.innerHTML = ''; // limpa
+
+      const cancelBtn = btn('Cancelar', 'crm-btn crm-btn-secondary', () => { closeAll(); openRelatorios(); });
+      const dlBtn = btn('Baixar Planilha', 'crm-btn crm-btn-primary', () => {
+        const permitidas = Array.from(document.querySelectorAll('.rel-col-chk:checked')).map(el => parseInt(el.value));
+
+        // Salva as datas do filtro atual ANTES de fechar a tela que vai recarregar tudo
+        const ini = document.getElementById('rel-dt-ini') ? document.getElementById('rel-dt-ini').value : '';
+        const fim = document.getElementById('rel-dt-fim') ? document.getElementById('rel-dt-fim').value : '';
+
+        closeAll();
+        openRelatorios(); // reabre a tela original por baixo (que infelizmente reseta os campos para o dia 01)
+
+        // Devolve as datas escolhidas pelo usuario
+        if (ini) document.getElementById('rel-dt-ini').value = ini;
+        if (fim) document.getElementById('rel-dt-fim').value = fim;
+
+        exportarExcelReal(permitidas);
+      });
+
+      ftr.appendChild(cancelBtn);
+      ftr.appendChild(dlBtn);
+      document.getElementById(mId).classList.add('visible');
+      showOverlay();
+    }
+
+    async function exportarExcelReal(colunasPermitidas) {
       const ini = document.getElementById('rel-dt-ini').value;
       const fim = document.getElementById('rel-dt-fim').value;
-      const list = (state.data.atendimentos || []).filter(a => { const d = a.date || ''; return d >= ini && d <= fim; });
+      const statusEl = document.getElementById('rel-status');
+
+      let list = (state.data.atendimentos || []).filter(a => { const d = a.date || ''; return d >= ini && d <= fim; });
+
+      // Filtragem cruzada pelo Kanban (opcional: se não estiver no kanban, marca como "Sem Coluna" e passa se a coluna "Sem Coluna" estiver marcada, ou passa direto se não tiver isso)
+      const funil = getFunil();
+      // O usuário selecionou checkboxes das colunas.
+      // Se ele permitiu "todas as listadas", e os que não estão no kanban não tem coluna listada, então nós vamos exportar GERAL independentemente caso o cara mande exportar (para não sumir dados) - Modificacao: Exportar sem filtrar out quem não está no kanban, ou incluir "Fora do Funil" na checagem.
+
+      list = list.filter(a => {
+        const targetLower = (a.contato || '').toLowerCase();
+        const card = funil.cards.find(c => c.nome.toLowerCase() === targetLower || (c.telefone && c.telefone === a.contato));
+        if (!card) return true; // EXPORTA MESMO QUE NAO ESTEJA NO KANBAN!
+        return colunasPermitidas.includes(card.coluna);
+      });
+
       list.sort((a, b) => (b.date || '').localeCompare(a.date || '') || (a.contato || '').localeCompare(b.contato || ''));
-      if (list.length === 0) { document.getElementById('rel-status').textContent = '⚠️ Nenhum dado para exportar no período selecionado.'; return; }
+      if (list.length === 0) {
+        if (statusEl) statusEl.textContent = '⚠️ Nenhum dado para exportar nas colunas e período selecionados.';
+        return;
+      }
+
+      function getHoraBrasilia(val, isoTimestamp) {
+        if (isoTimestamp) {
+          try {
+            const d = new Date(isoTimestamp);
+            if (!isNaN(d.getTime())) {
+              return d.toLocaleTimeString('pt-BR', { timeZone: 'America/Sao_Paulo', hour: '2-digit', minute: '2-digit', hour12: false });
+            }
+          } catch (e) {}
+        }
+        if (!val) return '';
+        if (typeof val === 'string' && val.includes('T')) {
+          try {
+            const d2 = new Date(val);
+            if (!isNaN(d2.getTime())) {
+              return d2.toLocaleTimeString('pt-BR', { timeZone: 'America/Sao_Paulo', hour: '2-digit', minute: '2-digit', hour12: false });
+            }
+          } catch (e) {}
+        }
+        if (/^\d{2}:\d{2}$/.test(val)) return val;
+        if (/^\d{2}:\d{2}:\d{2}$/.test(val)) return val.substring(0, 5);
+        return String(val);
+      }
 
       const payloadList = list.map(a => {
         const parts = (a.date || '').split('-');
         const brDate = parts.length === 3 ? `${parts[2]}/${parts[1]}/${parts[0]}` : (a.date || '');
+        const targetLower = (a.contato || '').toLowerCase();
+        const card = funil.cards.find(c => c.nome.toLowerCase() === targetLower || (c.telefone && c.telefone === a.contato));
+        const colunaNome = card && funil.colunas[card.coluna] ? _normCol(funil.colunas[card.coluna]).nome : 'Desconhecida';
+
+        const horaIni = getHoraBrasilia(a.horaInicio || a.hora_inicio, a.created_at);
+        const horaFim = getHoraBrasilia(a.horaFim || a.hora_fim, a.updated_at);
+
         return {
           'Data': brDate,
           'Contato': a.contato || '',
+          'Coluna Kanban': colunaNome,
           'Última Mensagem': a.ultimaMensagem || '',
           'Mensagens': a.numMensagens || 1,
-          'Hora Início': a.horaInicio || '',
-          'Hora Fim': a.horaFim || ''
+          'Hora Início': horaIni,
+          'Hora Fim': horaFim
         };
       });
 
-      document.getElementById('rel-status').style.color = '#f59e0b';
-      document.getElementById('rel-status').textContent = '⏳ Gerando arquivo Excel (.xlsx)...';
+      if (statusEl) {
+        statusEl.style.color = '#f59e0b';
+        statusEl.textContent = '⏳ Gerando arquivo Excel (.xlsx)...';
+      }
 
+      function exportClientSideXLSX(dataList, fileName) {
+        if (!dataList || dataList.length === 0) return false;
+        try {
+          const xlsxLib = (typeof XLSX !== 'undefined' && XLSX.utils) ? XLSX : (typeof window !== 'undefined' && window.XLSX && window.XLSX.utils ? window.XLSX : null);
+          if (xlsxLib) {
+            const ws = xlsxLib.utils.json_to_sheet(dataList);
+            const wb = xlsxLib.utils.book_new();
+            xlsxLib.utils.book_append_sheet(wb, ws, 'Relatorios');
+            const wbout = xlsxLib.write(wb, { bookType: 'xlsx', type: 'array' });
+            const blob = new Blob([wbout], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = fileName;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(url);
+            return true;
+          } else {
+            console.warn('[FlowZap Export] Objeto global XLSX não encontrado.');
+          }
+        } catch (e) {
+          console.error('[FlowZap XLSX Export Erro]', e);
+        }
+        return false;
+      }
+
+      function exportClientSideCSV(dataList, fileName) {
+        if (!dataList || dataList.length === 0) return false;
+        const headers = Object.keys(dataList[0]);
+        let csv = '\uFEFF';
+        csv += headers.join(';') + '\n';
+        dataList.forEach(row => {
+          const line = headers.map(h => {
+            let val = row[h] !== undefined && row[h] !== null ? String(row[h]) : '';
+            val = val.replace(/"/g, '""');
+            if (val.includes(';') || val.includes('\n') || val.includes('\r') || val.includes('"')) {
+              val = `"${val}"`;
+            }
+            return val;
+          }).join(';');
+          csv += line + '\n';
+        });
+        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = fileName;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+        return true;
+      }
+
+      // Tenta primeiro gerar o arquivo .XLSX real direto no front-end
+      const fileNameXlsx = `relatorio_atendimentos_${ini}_${fim}.xlsx`;
+      const generatedXlsx = exportClientSideXLSX(payloadList, fileNameXlsx);
+
+      if (generatedXlsx) {
+        if (statusEl) {
+          statusEl.style.color = '#00a884';
+          statusEl.textContent = `✅ ${list.length} registro(s) exportados com sucesso (.xlsx)!`;
+        }
+        return;
+      }
+
+      // Se falhar o XLSX no front, tenta chamar a API local ou fallback CSV
       try {
         const res = await fetch('http://localhost:3001/api/export-xlsx', {
           method: 'POST',
@@ -915,23 +1140,32 @@
           body: JSON.stringify({ list: payloadList })
         });
 
-        if (!res.ok) throw new Error('Falha na resposta do servidor.');
+        if (!res.ok) throw new Error('Servidor local não respondeu');
 
         const blob = await res.blob();
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = `relatorio_atendimentos_${ini}_${fim}.xlsx`;
+        a.download = fileNameXlsx;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
 
-        document.getElementById('rel-status').style.color = '#00a884';
-        document.getElementById('rel-status').textContent = `✅ ${list.length} registro(s) exportados com sucesso (.xlsx)!`;
+        if (statusEl) {
+          statusEl.style.color = '#00a884';
+          statusEl.textContent = `✅ ${list.length} registro(s) exportados com sucesso (.xlsx)!`;
+        }
       } catch (err) {
-        document.getElementById('rel-status').style.color = '#ef4444';
-        document.getElementById('rel-status').textContent = `❌ Erro ao gerar XLSX: ${err.message}`;
+        console.warn('[FlowZap Export] Servidor local indisponível, gerando CSV de fallback...', err);
+        const exported = exportClientSideCSV(payloadList, `relatorio_atendimentos_${ini}_${fim}.csv`);
+        if (exported && statusEl) {
+          statusEl.style.color = '#00a884';
+          statusEl.textContent = `✅ ${list.length} registro(s) exportados com sucesso para Excel (.csv)!`;
+        } else if (statusEl) {
+          statusEl.style.color = '#ef4444';
+          statusEl.textContent = `❌ Erro ao exportar dados: ${err.message}`;
+        }
       }
     }
 
@@ -1267,9 +1501,13 @@
     // Tenta múltiplos seletores para encontrar o painel de chats
     const paneSelectors = [
       '#pane-side',
+      '#side',
       '[data-testid="chat-list"]',
       '[aria-label="Lista de conversas"]',
+      '[aria-label="Conversas"]',
       '[aria-label="Chat list"]',
+      '[aria-label="Chats"]',
+      'div[role="navigation"] div[role="grid"]',
       'div[role="grid"]'
     ];
     let pane = null;
@@ -1306,10 +1544,22 @@
 
     items.forEach(item => {
       try {
-        // Nome do contato/grupo
-        const titleEl = item.querySelector('span[title]');
-        const nome = titleEl?.getAttribute('title') || titleEl?.textContent?.trim() || '';
+        // Título oficial do chat/grupo (prioriza container de título para evitar lista de participantes no subtítulo)
+        const titleContainer = item.querySelector('[data-testid="cell-frame-title"]') || item.querySelector('.copyable-text');
+        const titleEl = titleContainer ? titleContainer.querySelector('span[title]') : item.querySelector('span[title]');
+        let nome = titleEl?.getAttribute('title') || titleEl?.textContent?.trim() || '';
         if (!nome || nome.length < 2) return;
+
+        // Detecta se é um grupo
+        const isGroup = !!(item.querySelector('[data-icon*="group"]') || item.querySelector('[data-icon*="community"]') || (item.innerHTML && item.innerHTML.includes('avatar-group')));
+
+        // Se for grupo e o nome parecer lista de pessoas (várias vírgulas), busca o elemento pai único
+        if (isGroup && nome.includes(',')) {
+          const mainTitleNode = item.querySelector('[data-testid="cell-frame-title"] span');
+          if (mainTitleNode && mainTitleNode.textContent && !mainTitleNode.textContent.includes(',')) {
+            nome = mainTitleNode.textContent.trim();
+          }
+        }
 
         // Última mensagem - múltiplas tentativas
         let lastMsg = '';
@@ -1342,7 +1592,7 @@
           if (t && /^\d{1,2}\/\d{1,2}/.test(t)) { time = t; break; }
         }
 
-        chats.push({ nome, lastMsg: lastMsg.substring(0, 80), unread, time });
+        chats.push({ nome, lastMsg: lastMsg.substring(0, 80), unread, time, isGroup });
       } catch (e) { }
     });
 
@@ -1351,49 +1601,64 @@
   }
 
   function navigateToChat(chatName) {
-    const pane = document.querySelector('#pane-side') ||
-      document.querySelector('[data-testid="chat-list"]');
-    if (!pane) { console.log('[FlowZap] ❌ Sidebar não encontrado'); return false; }
+    if (!chatName) return false;
+    const cleanTarget = chatName.toLowerCase().replace(/^👥\s*/, '').replace(/\(\d+\)/g, '').trim();
 
-    // Mesma lógica de srapeChats (mais robusta)
-    let items = pane.querySelectorAll('[data-testid="cell-frame-container"]');
-    if (!items.length) items = pane.querySelectorAll('[data-testid="list-item-container"]');
-    if (!items.length) items = pane.querySelectorAll('[role="listitem"]');
-    if (!items.length) items = pane.querySelectorAll('[role="row"]');
-    if (!items.length) items = pane.querySelectorAll('[tabindex="-1"]');
+    const pane = document.querySelector('#pane-side') || document.querySelector('[data-testid="chat-list"]');
+    let items = pane ? pane.querySelectorAll('[data-testid="cell-frame-container"]') : [];
+    if (!items || !items.length) {
+      items = document.querySelectorAll('#pane-side div[role="row"], #pane-side div[role="listitem"]');
+    }
 
-    console.log('[FlowZap] 🔍 Procurando "' + chatName + '" em ' + items.length + ' itens');
-    if (items.length === 0) return false;
+    console.log('[FlowZap] 🔍 Procurando "' + cleanTarget + '" em ' + items.length + ' itens visíveis');
 
-    const chatNameLower = chatName.toLowerCase();
     for (const item of items) {
-      const titleEl = item.querySelector('span[title]');
-      const name = titleEl?.getAttribute('title') || titleEl?.textContent?.trim() || '';
-      if (name.toLowerCase() === chatNameLower) {
+      const titleEl = item.querySelector('[data-testid="cell-frame-title"] span[title]') || item.querySelector('span[title]');
+      const name = (titleEl?.getAttribute('title') || titleEl?.textContent?.trim() || '').toLowerCase();
 
-        // Ao invés de usar múltiplos .click() nativos que acionam proteção de stack no React (causando o erro multiple-uim-roots),
-        // devemos disparar o evento mousedown (que o WA Web escuta primeiro) e um click perfeito usando PointerEvent se possível
-        const clickTarget = titleEl ? titleEl.closest('div') : item;
+      if (name && (name === cleanTarget || name.includes(cleanTarget) || cleanTarget.includes(name))) {
+        const clickTarget = titleEl ? (titleEl.closest('div[role="button"]') || titleEl.closest('div')) : item;
 
         const mousedown = new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window });
         const mouseup = new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window });
         const click = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
 
-        if (clickTarget) {
-          clickTarget.dispatchEvent(mousedown);
-          clickTarget.dispatchEvent(mouseup);
-          clickTarget.dispatchEvent(click);
-        } else {
-          item.dispatchEvent(mousedown);
-          item.dispatchEvent(mouseup);
-          item.dispatchEvent(click);
-        }
-
+        clickTarget.dispatchEvent(mousedown);
+        clickTarget.dispatchEvent(mouseup);
+        clickTarget.dispatchEvent(click);
         console.log('[FlowZap] ✅ Click sintético disparado em:', name);
         return true;
       }
     }
-    console.log('[FlowZap] ❌ Nome não encontrado no sidebar após examinar ' + items.length + ' itens');
+
+    // Fallback 1: Rola a lista virtual
+    if (pane && pane.scrollTop !== undefined) {
+      pane.scrollTop += 250;
+    }
+
+    // Fallback 2: Tenta a barra de pesquisa do WhatsApp Web
+    const searchInput = document.querySelector('div[contenteditable="true"][data-tab="3"]') ||
+      document.querySelector('[data-testid="chat-list-search"]') ||
+      document.querySelector('#side input');
+
+    if (searchInput) {
+      console.log('[FlowZap] 🔍 Usando busca do WhatsApp para encontrar:', cleanTarget);
+      searchInput.focus();
+      try { document.execCommand('insertText', false, cleanTarget); } catch (e) { searchInput.textContent = cleanTarget; }
+      searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+
+      setTimeout(() => {
+        const firstRes = document.querySelector('#pane-side [data-testid="cell-frame-container"]') ||
+          document.querySelector('#pane-side div[role="row"]');
+        if (firstRes) {
+          firstRes.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+          firstRes.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+          firstRes.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+        }
+      }, 500);
+      return true;
+    }
+
     return false;
   }
 
@@ -1430,214 +1695,13 @@
     setTimeout(tryNavigate, 300);
   }
 
-  let _kanbanRefreshInterval = null;
-
-  function openFunis() {
-    document.getElementById('crm-kanban-modal')?.remove();
-    clearInterval(_kanbanRefreshInterval);
-
-    // Auto-importa ao abrir
-    importChatsToKanban();
-
-    const modal = makeModal('crm-kanban-modal', '📋 Kanban CRM', true);
-    modal.style.width = Math.min(1100, window.innerWidth - 60) + 'px';
-    modal.style.maxHeight = '85vh';
-
-    const body = document.getElementById('crm-kanban-modal-body');
-    const footer = document.getElementById('crm-kanban-modal-footer');
-
-    body.style.overflow = 'hidden';
-    body.style.padding = '0';
-    body.style.display = 'flex';
-    body.style.flexDirection = 'column';
-    body.style.height = '100%';
-
-    // Toolbar
-    const toolbar = document.createElement('div');
-    toolbar.style.cssText = 'display:flex;gap:8px;padding:10px 16px;border-bottom:1px solid var(--crm-border);align-items:center;flex-shrink:0;';
-
-    const liveIndicator = document.createElement('span');
-    liveIndicator.style.cssText = 'font-size:11px;color:#00a884;font-weight:600;display:flex;align-items:center;gap:4px;';
-    liveIndicator.innerHTML = '<span style="width:6px;height:6px;background:#00a884;border-radius:50%;display:inline-block;animation:crm-pulse 2s infinite;"></span> Ao vivo';
-
-    const addColBtn = document.createElement('button');
-    addColBtn.className = 'crm-btn crm-btn-secondary';
-    addColBtn.innerHTML = '+ Coluna';
-    addColBtn.style.fontSize = '12px';
-    addColBtn.addEventListener('click', openNovaColuna);
-
-    const fullscreenBtn = document.createElement('button');
-    fullscreenBtn.className = 'crm-btn crm-btn-secondary';
-    fullscreenBtn.innerHTML = '🔲 Expandir';
-    fullscreenBtn.style.fontSize = '12px';
-    let isFullscreen = false;
-    fullscreenBtn.addEventListener('click', () => {
-      isFullscreen = !isFullscreen;
-      if (isFullscreen) {
-        modal.dataset.origWidth = modal.style.width;
-        modal.style.width = '100vw';
-        modal.style.height = '100vh';
-        modal.style.maxHeight = '100vh';
-        modal.style.maxWidth = '100vw';
-        modal.style.borderRadius = '0';
-        fullscreenBtn.innerHTML = '🔲 Restaurar';
-      } else {
-        modal.style.width = modal.dataset.origWidth;
-        modal.style.height = '';
-        modal.style.maxHeight = '85vh';
-        modal.style.maxWidth = '';
-        modal.style.borderRadius = '';
-        fullscreenBtn.innerHTML = '🔲 Expandir';
-      }
-    });
-
-    const infoText = document.createElement('span');
-    infoText.id = 'crm-kanban-info';
-    infoText.style.cssText = 'font-size:11px;color:var(--crm-text-secondary);margin-left:auto;';
-    const totalCards = getFunil().cards.length;
-    infoText.textContent = `${totalCards} contatos`;
-
-    toolbar.appendChild(liveIndicator);
-    toolbar.appendChild(addColBtn);
-    toolbar.appendChild(fullscreenBtn);
-    toolbar.appendChild(infoText);
-    body.appendChild(toolbar);
-
-    // Search bar
-    const searchBar = document.createElement('div');
-    searchBar.style.cssText = 'padding:8px 16px;border-bottom:1px solid var(--crm-border);flex-shrink:0;display:flex;gap:8px;align-items:center;';
-
-    const searchIcon = document.createElement('span');
-    searchIcon.style.cssText = 'font-size:14px;';
-    searchIcon.textContent = '🔍';
-
-    const searchInput = document.createElement('input');
-    searchInput.className = 'crm-input';
-    searchInput.placeholder = 'Buscar contato por nome ou número...';
-    searchInput.style.cssText = 'flex:1;font-size:12px;padding:6px 10px;border-radius:8px;';
-
-    const searchResult = document.createElement('div');
-    searchResult.id = 'crm-kanban-search-result';
-    searchResult.style.cssText = 'font-size:11px;color:var(--crm-text-secondary);white-space:nowrap;';
-
-    let searchTimer = null;
-    searchInput.addEventListener('input', () => {
-      clearTimeout(searchTimer);
-      searchTimer = setTimeout(() => {
-        const q = searchInput.value.trim().toLowerCase();
-        highlightSearch(q, searchResult);
-      }, 200);
-    });
-
-    const clearBtn = document.createElement('button');
-    clearBtn.style.cssText = 'background:none;border:none;cursor:pointer;font-size:14px;color:#aaa;padding:2px;display:none;';
-    clearBtn.innerHTML = '✕';
-    clearBtn.addEventListener('click', () => {
-      searchInput.value = '';
-      highlightSearch('', searchResult);
-      clearBtn.style.display = 'none';
-    });
-    searchInput.addEventListener('input', () => {
-      clearBtn.style.display = searchInput.value ? 'block' : 'none';
-    });
-
-    searchBar.appendChild(searchIcon);
-    searchBar.appendChild(searchInput);
-    searchBar.appendChild(clearBtn);
-    searchBar.appendChild(searchResult);
-    body.appendChild(searchBar);
-
-    // Board container
-    const boardContainer = document.createElement('div');
-    boardContainer.id = 'crm-kanban-board-area';
-    boardContainer.style.cssText = 'flex:1;overflow:auto;padding:12px 16px;';
-    body.appendChild(boardContainer);
-
-    renderKanban(boardContainer);
-
-    footer.appendChild(btn('➕ Adicionar Contato Manual', 'crm-btn crm-btn-secondary', openNovoCardFunil));
-
-    openModal('crm-kanban-modal');
-
-    // Auto-refresh a cada 15 segundos enquanto o Kanban estiver aberto
-    _kanbanRefreshInterval = setInterval(() => {
-      if (!document.getElementById('crm-kanban-modal')) {
-        clearInterval(_kanbanRefreshInterval);
-        return;
-      }
-      importChatsToKanban();
-      const area = document.getElementById('crm-kanban-board-area');
-      if (area) {
-        renderKanban(area);
-        const info = document.getElementById('crm-kanban-info');
-        if (info) info.textContent = `${getFunil().cards.length} contatos`;
-      }
-    }, 15000);
-  }
-
-  function highlightSearch(query, resultEl) {
-    const boardArea = document.getElementById('crm-kanban-board-area');
-    if (!boardArea) return;
-
-    const allCards = boardArea.querySelectorAll('.crm-kanban-card');
-    let matchCount = 0;
-    const matchLocations = [];
-
-    allCards.forEach(cardEl => {
-      // Reset
-      cardEl.style.opacity = '';
-      cardEl.style.borderColor = '';
-      cardEl.style.boxShadow = '';
-      const oldBadge = cardEl.querySelector('.crm-search-badge');
-      if (oldBadge) oldBadge.remove();
-
-      if (!query) return;
-
-      const name = (cardEl.querySelector('[title="Clique para abrir conversa"]')?.textContent || '').toLowerCase();
-      const phone = cardEl.textContent?.toLowerCase() || '';
-      const match = name.includes(query) || phone.includes(query);
-
-      if (match) {
-        matchCount++;
-        cardEl.style.borderColor = '#00a884';
-        cardEl.style.boxShadow = '0 0 0 2px rgba(0,168,132,0.25), 0 4px 12px rgba(0,168,132,0.15)';
-        cardEl.style.opacity = '1';
-
-        // Encontra a coluna
-        const colEl = cardEl.closest('.crm-kanban-col') || cardEl.closest('[data-col]')?.parentElement;
-        const colTitle = colEl?.querySelector('span')?.textContent || '?';
-        matchLocations.push(colTitle);
-
-        // Badge indicando a coluna
-        const badge = document.createElement('div');
-        badge.className = 'crm-search-badge';
-        badge.style.cssText = 'background:#00a884;color:white;font-size:9px;font-weight:700;padding:2px 6px;border-radius:4px;position:absolute;top:-6px;right:8px;z-index:1;white-space:nowrap;';
-        badge.textContent = '📍 ' + colTitle;
-        cardEl.appendChild(badge);
-      } else {
-        cardEl.style.opacity = '0.2';
-      }
-    });
-
-    // Update result text
-    if (!query) {
-      resultEl.textContent = '';
-    } else if (matchCount === 0) {
-      resultEl.innerHTML = '<span style="color:#ef4444;">Nenhum resultado</span>';
-    } else {
-      const uniqueCols = [...new Set(matchLocations)];
-      resultEl.innerHTML = `<span style="color:#00a884;font-weight:600;">${matchCount} encontrado${matchCount > 1 ? 's' : ''}</span>` +
-        ` em: ${uniqueCols.join(', ')}`;
-    }
-  }
-
   // Importa conversas visíveis do WhatsApp sidebar que ainda não estão no Kanban
   // A ordem do sidebar DO WHATSAPP é usada diretamente (posição 0 = conversa mais recente)
   function importChatsToKanban() {
     const funil = getFunil();
     const chats = scrapeChatsFromSidebar();
     let added = 0;
-    const contactsWithNewActivity = [];
+    const contactsWithNewIncoming = [];
 
     chats.forEach((chat, idx) => {
       const existingCard = funil.cards.find(c =>
@@ -1645,6 +1709,7 @@
       );
 
       if (!existingCard) {
+        // Novo contato detectado na sidebar — adiciona na coluna 0
         funil.cards.push({
           id: Date.now() + Math.floor(Math.random() * 10000) + added,
           nome: chat.nome,
@@ -1658,20 +1723,23 @@
         });
         added++;
       } else {
-        // Detecta se houve nova atividade (mensagem diferente ou unread aumentou)
+        // Detecta se houve nova mensagem RECEBIDA (unread aumentou ou mensagem mudou)
+        const prevUnread = existingCard._lastSeenUnread || 0;
+        const curUnread = chat.unread || 0;
+        const hasMoreUnread = curUnread > prevUnread;
         const hasNewMsg = chat.lastMsg && chat.lastMsg !== existingCard.lastMsg;
-        const hasMoreUnread = (chat.unread || 0) > (existingCard._lastSeenUnread || 0);
 
+        // Atualiza dados visuais
         existingCard.lastMsg = chat.lastMsg || existingCard.lastMsg;
-        existingCard.unread = chat.unread || 0;
+        existingCard.unread = curUnread;
         existingCard.time = chat.time || existingCard.time;
         existingCard.sidebarOrder = idx;
+        existingCard._lastSeenUnread = curUnread;
 
-        if (hasNewMsg || hasMoreUnread) {
-          contactsWithNewActivity.push({ nome: chat.nome, lastMsg: chat.lastMsg });
+        // Se o unread aumentou OU a mensagem mudou, há atividade nova
+        if (hasMoreUnread || hasNewMsg) {
+          contactsWithNewIncoming.push({ nome: chat.nome, lastMsg: chat.lastMsg });
         }
-        // Salva o unread atual para comparar no próximo ciclo
-        existingCard._lastSeenUnread = chat.unread || 0;
       }
     });
 
@@ -1679,11 +1747,12 @@
       saveData();
     }
 
-    // Processa regras para contatos com nova atividade
-    if (contactsWithNewActivity.length > 0) {
-      console.log(`[FlowZap Kanban] 🔔 ${contactsWithNewActivity.length} contatos com nova atividade:`, contactsWithNewActivity.map(c => c.nome).join(', '));
-      contactsWithNewActivity.forEach(c => {
-        tryAutoAddKanban(c.nome, c.lastMsg);
+    // Dispara automação para contatos com nova atividade detectada na sidebar
+    // O tryAutoAddKanban vai decidir se é new_message ou message_sent (via isRecentSent)
+    if (contactsWithNewIncoming.length > 0) {
+      console.log(`[FlowZap Kanban] 🔔 Sidebar detectou ${contactsWithNewIncoming.length} contatos com atividade nova:`, contactsWithNewIncoming.map(c => c.nome).join(', '));
+      contactsWithNewIncoming.forEach(c => {
+        tryAutoAddKanban(c.nome, c.lastMsg, 'new_message');
       });
     }
 
@@ -1982,9 +2051,14 @@
                 const opt = document.createElement('option');
                 opt.value = ci2;
                 opt.textContent = cName;
-                if (String(cond.value) === String(ci2)) opt.selected = true;
+                if (String(cond.value) === String(ci2) || String(cond.value) === String(c.id) || String(cond.value).toLowerCase() === cName.toLowerCase()) {
+                  opt.selected = true;
+                }
                 colSel.appendChild(opt);
               });
+              if ((cond.value === undefined || cond.value === '') && colSel.options.length > 0) {
+                cond.value = colSel.options[0].value;
+              }
               colSel.addEventListener('change', () => { cond.value = colSel.value; });
               condRow.appendChild(colSel);
             } else {
@@ -2089,6 +2163,378 @@
   }
 
   let dragColIdx = null;
+  let _kanbanRefreshInterval = null;
+
+  function openFunis() {
+    document.getElementById('crm-kanban-modal')?.remove();
+    clearInterval(_kanbanRefreshInterval);
+
+    // Auto-importa ao abrir
+    importChatsToKanban();
+
+    const modal = makeModal('crm-kanban-modal', '📋 Kanban CRM', true);
+    modal.style.width = Math.min(1250, window.innerWidth - 40) + 'px';
+    modal.style.height = '88vh';
+    modal.style.maxHeight = '88vh';
+
+    const body = document.getElementById('crm-kanban-modal-body');
+    const footer = document.getElementById('crm-kanban-modal-footer');
+
+    body.style.overflow = 'hidden';
+    body.style.padding = '0';
+    body.style.display = 'flex';
+    body.style.flexDirection = 'column';
+    body.style.height = '100%';
+
+    // Toolbar
+    const toolbar = document.createElement('div');
+    toolbar.style.cssText = 'display:flex;gap:8px;padding:10px 16px;border-bottom:1px solid var(--crm-border);align-items:center;flex-shrink:0;background:#f8fafc;';
+
+    const liveIndicator = document.createElement('span');
+    liveIndicator.style.cssText = 'font-size:11px;color:#00a884;font-weight:600;display:flex;align-items:center;gap:4px;';
+    liveIndicator.innerHTML = '<span style="width:6px;height:6px;background:#00a884;border-radius:50%;display:inline-block;animation:crm-pulse 2s infinite;"></span> Ao vivo';
+
+    const addColBtn = document.createElement('button');
+    addColBtn.className = 'crm-btn crm-btn-secondary';
+    addColBtn.innerHTML = '+ Coluna';
+    addColBtn.style.fontSize = '12px';
+    addColBtn.addEventListener('click', openNovaColuna);
+
+    const bulkImportBtn = document.createElement('button');
+    bulkImportBtn.className = 'crm-btn crm-btn-secondary';
+    bulkImportBtn.innerHTML = '📥 Carregar em Massa';
+    bulkImportBtn.style.fontSize = '12px';
+    bulkImportBtn.addEventListener('click', () => openImportacaoMassa(0));
+
+    const fullscreenBtn = document.createElement('button');
+    fullscreenBtn.className = 'crm-btn crm-btn-secondary';
+    fullscreenBtn.innerHTML = '🔲 Restaurar';
+    fullscreenBtn.style.fontSize = '12px';
+    let isFullscreen = true;
+
+    // Abre expandido por padrão
+    modal.dataset.origWidth = modal.style.width;
+    modal.style.width = '100vw';
+    modal.style.height = '100vh';
+    modal.style.maxHeight = '100vh';
+    modal.style.maxWidth = '100vw';
+    modal.style.borderRadius = '0';
+
+    fullscreenBtn.addEventListener('click', () => {
+      isFullscreen = !isFullscreen;
+      if (isFullscreen) {
+        modal.dataset.origWidth = modal.style.width;
+        modal.style.width = '100vw';
+        modal.style.height = '100vh';
+        modal.style.maxHeight = '100vh';
+        modal.style.maxWidth = '100vw';
+        modal.style.borderRadius = '0';
+        fullscreenBtn.innerHTML = '🔲 Restaurar';
+      } else {
+        modal.style.width = modal.dataset.origWidth;
+        modal.style.height = '88vh';
+        modal.style.maxHeight = '88vh';
+        modal.style.maxWidth = '';
+        modal.style.borderRadius = '';
+        fullscreenBtn.innerHTML = '🔲 Expandir';
+      }
+    });
+
+    const infoText = document.createElement('span');
+    infoText.id = 'crm-kanban-info';
+    infoText.style.cssText = 'font-size:11px;color:var(--crm-text-secondary);margin-left:auto;font-weight:600;';
+    const totalCards = getFunil().cards.length;
+    infoText.textContent = `${totalCards} contatos no Kanban`;
+
+    toolbar.appendChild(liveIndicator);
+    toolbar.appendChild(addColBtn);
+    toolbar.appendChild(bulkImportBtn);
+    toolbar.appendChild(fullscreenBtn);
+    toolbar.appendChild(infoText);
+    body.appendChild(toolbar);
+
+    // Search bar
+    const searchBar = document.createElement('div');
+    searchBar.style.cssText = 'padding:8px 16px;border-bottom:1px solid var(--crm-border);flex-shrink:0;display:flex;gap:8px;align-items:center;background:#ffffff;';
+
+    const searchIcon = document.createElement('span');
+    searchIcon.style.cssText = 'font-size:14px;';
+    searchIcon.textContent = '🔍';
+
+    const searchInput = document.createElement('input');
+    searchInput.className = 'crm-input';
+    searchInput.placeholder = 'Buscar contato por nome, número ou etiqueta...';
+    searchInput.style.cssText = 'flex:1;font-size:12px;padding:6px 10px;border-radius:8px;';
+
+    const searchResult = document.createElement('div');
+    searchResult.id = 'crm-kanban-search-result';
+    searchResult.style.cssText = 'font-size:11px;color:var(--crm-text-secondary);white-space:nowrap;';
+
+    let searchTimer = null;
+    searchInput.addEventListener('input', () => {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(() => {
+        const q = searchInput.value.trim().toLowerCase();
+        highlightSearch(q, searchResult);
+      }, 200);
+    });
+
+    const clearBtn = document.createElement('button');
+    clearBtn.style.cssText = 'background:none;border:none;cursor:pointer;font-size:14px;color:#aaa;padding:2px;display:none;';
+    clearBtn.innerHTML = '✕';
+    clearBtn.addEventListener('click', () => {
+      searchInput.value = '';
+      highlightSearch('', searchResult);
+      clearBtn.style.display = 'none';
+    });
+    searchInput.addEventListener('input', () => {
+      clearBtn.style.display = searchInput.value ? 'block' : 'none';
+    });
+
+    searchBar.appendChild(searchIcon);
+    searchBar.appendChild(searchInput);
+    searchBar.appendChild(clearBtn);
+    searchBar.appendChild(searchResult);
+    body.appendChild(searchBar);
+
+    // Board container
+    const boardContainer = document.createElement('div');
+    boardContainer.id = 'crm-kanban-board-area';
+    boardContainer.style.cssText = 'flex:1;overflow:hidden;padding:12px 16px;box-sizing:border-box;height:100%;';
+    body.appendChild(boardContainer);
+
+    renderKanban(boardContainer);
+
+    footer.appendChild(btn('➕ Adicionar Contato Manual', 'crm-btn crm-btn-secondary', openNovoCardFunilComColuna));
+    footer.appendChild(btn('📥 Carregar em Massa', 'crm-btn crm-btn-primary', () => openImportacaoMassa(0)));
+
+    openModal('crm-kanban-modal');
+
+    // Auto-refresh a cada 15 segundos enquanto o Kanban estiver aberto
+    _kanbanRefreshInterval = setInterval(() => {
+      if (!document.getElementById('crm-kanban-modal')) {
+        clearInterval(_kanbanRefreshInterval);
+        return;
+      }
+      importChatsToKanban();
+      const area = document.getElementById('crm-kanban-board-area');
+      if (area) {
+        renderKanban(area);
+        const info = document.getElementById('crm-kanban-info');
+        if (info) info.textContent = `${getFunil().cards.length} contatos no Kanban`;
+      }
+    }, 15000);
+  }
+
+  function highlightSearch(query, resultEl) {
+    const boardArea = document.getElementById('crm-kanban-board-area');
+    if (!boardArea) return;
+
+    const allCards = boardArea.querySelectorAll('.crm-kanban-card');
+    let matchCount = 0;
+    const matchLocations = [];
+
+    allCards.forEach(cardEl => {
+      cardEl.style.opacity = '';
+      cardEl.style.borderColor = '';
+      cardEl.style.boxShadow = '';
+      const oldBadge = cardEl.querySelector('.crm-search-badge');
+      if (oldBadge) oldBadge.remove();
+
+      if (!query) return;
+
+      const name = (cardEl.querySelector('[title*="WhatsApp"]')?.textContent || cardEl.textContent || '').toLowerCase();
+      const match = name.includes(query);
+
+      if (match) {
+        matchCount++;
+        cardEl.style.borderColor = '#00a884';
+        cardEl.style.boxShadow = '0 0 0 2px rgba(0,168,132,0.25), 0 4px 12px rgba(0,168,132,0.15)';
+        cardEl.style.opacity = '1';
+
+        const colEl = cardEl.closest('.crm-kanban-col');
+        const colTitle = colEl?.querySelector('.crm-kanban-col-title span')?.textContent || '?';
+        matchLocations.push(colTitle);
+
+        const badge = document.createElement('div');
+        badge.className = 'crm-search-badge';
+        badge.style.cssText = 'background:#00a884;color:white;font-size:9px;font-weight:700;padding:2px 6px;border-radius:4px;position:absolute;top:-6px;right:8px;z-index:1;white-space:nowrap;';
+        badge.textContent = '📍 ' + colTitle;
+        cardEl.appendChild(badge);
+      } else {
+        cardEl.style.opacity = '0.2';
+      }
+    });
+
+    if (!query) {
+      resultEl.textContent = '';
+    } else if (matchCount === 0) {
+      resultEl.innerHTML = '<span style="color:#ef4444;">Nenhum resultado</span>';
+    } else {
+      const uniqueCols = [...new Set(matchLocations)];
+      resultEl.innerHTML = `<span style="color:#00a884;font-weight:600;">${matchCount} encontrado${matchCount > 1 ? 's' : ''}</span>` +
+        ` em: ${uniqueCols.join(', ')}`;
+    }
+  }
+
+  function openLimparColuna(colIndex) {
+    const funil = getFunil();
+    const colObj = funil.colunas[colIndex];
+    const colName = typeof colObj === 'string' ? colObj : colObj.nome;
+    const cardsInCol = funil.cards.filter(c => c.coluna === colIndex);
+
+    if (cardsInCol.length === 0) {
+      alert(`A coluna "${colName}" já está vazia.`);
+      return;
+    }
+
+    if (confirm(`🧹 Limpar coluna "${colName}"?\nRemover todos os ${cardsInCol.length} contatos desta coluna?`)) {
+      funil.cards = funil.cards.filter(c => c.coluna !== colIndex);
+      saveData();
+      const area = document.getElementById('crm-kanban-board-area');
+      if (area) renderKanban(area);
+    }
+  }
+
+  function openImportacaoMassa(targetColIndex = 0) {
+    const funil = getFunil();
+
+    const mId = 'crm-bulk-import-modal';
+    document.getElementById(mId)?.remove();
+
+    const modal = makeModal(mId, `📥 Adicionar Contatos em Massa`, true);
+    modal.style.width = Math.min(850, window.innerWidth - 60) + 'px';
+
+    const body = document.getElementById(mId + '-body');
+    const footer = document.getElementById(mId + '-footer');
+
+    const chatsDisponiveis = scrapeChatsFromSidebar();
+
+    const colOptionsHtml = funil.colunas.map((col, idx) => {
+      const name = typeof col === 'string' ? col : col.nome;
+      return `<option value="${idx}" ${idx === targetColIndex ? 'selected' : ''}>${name}</option>`;
+    }).join('');
+
+    body.innerHTML = `
+      <div style="margin-bottom:14px;display:flex;align-items:center;gap:12px;background:#f8fafc;padding:10px 14px;border-radius:10px;border:1px solid #e2e8f0;">
+        <label style="font-weight:600;font-size:13px;color:#334155;">Coluna de Destino:</label>
+        <select id="crm-bulk-target-col" class="crm-select" style="width:220px;font-size:13px;padding:6px 10px;">
+          ${colOptionsHtml}
+        </select>
+      </div>
+
+      <div style="display:flex;gap:10px;margin-bottom:12px;">
+        <input type="text" id="crm-bulk-search" class="crm-input" placeholder="🔍 Filtrar conversas visíveis do WhatsApp..." style="flex:1;font-size:12px;padding:8px 12px;border-radius:8px;">
+        <button id="crm-bulk-select-all" class="crm-btn crm-btn-secondary" style="font-size:12px;padding:8px 14px;white-space:nowrap;">Selecionar Todos</button>
+      </div>
+
+      <div id="crm-bulk-list" style="max-height:260px;overflow-y:auto;border:1px solid var(--crm-border);border-radius:10px;padding:6px;background:#ffffff;margin-bottom:14px;">
+        ${chatsDisponiveis.length === 0 ? '<div style="text-align:center;padding:24px;color:#64748b;font-size:13px;">Nenhum chat visível no sidebar do WhatsApp. Navegue no WhatsApp para carregar mais.</div>' : ''}
+        ${chatsDisponiveis.map((c, i) => `
+          <label style="display:flex;align-items:center;gap:12px;padding:8px 12px;border-bottom:1px solid #f1f5f9;cursor:pointer;border-radius:6px;transition:background 0.15s;" class="crm-bulk-item" data-name="${c.nome.toLowerCase()}">
+            <input type="checkbox" class="crm-bulk-chk" value="${i}" style="width:16px;height:16px;accent-color:#00a884;">
+            <div style="flex:1;overflow:hidden;">
+              <div style="font-size:13px;font-weight:700;color:#1e293b;display:flex;align-items:center;gap:6px;">
+                ${c.isGroup ? '<span style="background:#e0e7ff;color:#4338ca;padding:1px 6px;border-radius:6px;font-size:10px;">👥 Grupo</span>' : ''}
+                ${c.nome}
+              </div>
+              <div style="font-size:11px;color:#64748b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:2px;">${c.lastMsg || 'Sem mensagens recentes'}</div>
+            </div>
+          </label>
+        `).join('')}
+      </div>
+
+      <div>
+        <label style="font-size:12px;font-weight:700;color:#334155;display:block;margin-bottom:6px;">Ou Cole uma Lista em Lote (um nome ou número por linha):</label>
+        <textarea id="crm-bulk-text" class="crm-input" rows="3" placeholder="Estacio Franco&#10;+5511999998888&#10;Clareamento Dental Odonto" style="font-size:12px;border-radius:8px;"></textarea>
+      </div>
+    `;
+
+    const searchIn = document.getElementById('crm-bulk-search');
+    searchIn?.addEventListener('input', () => {
+      const q = searchIn.value.toLowerCase().trim();
+      document.querySelectorAll('.crm-bulk-item').forEach(el => {
+        const name = el.dataset.name || '';
+        el.style.display = (!q || name.includes(q)) ? 'flex' : 'none';
+      });
+    });
+
+    let allSelected = false;
+    document.getElementById('crm-bulk-select-all')?.addEventListener('click', () => {
+      allSelected = !allSelected;
+      document.querySelectorAll('.crm-bulk-chk').forEach(chk => {
+        if (chk.closest('.crm-bulk-item').style.display !== 'none') {
+          chk.checked = allSelected;
+        }
+      });
+      document.getElementById('crm-bulk-select-all').textContent = allSelected ? 'Desmarcar Todos' : 'Selecionar Todos';
+    });
+
+    footer.appendChild(btn('Cancelar', 'crm-btn crm-btn-secondary', () => {
+      document.getElementById(mId)?.remove();
+    }));
+
+    footer.appendChild(btn('📥 Adicionar Selecionados', 'crm-btn crm-btn-primary', () => {
+      const targetCol = parseInt(document.getElementById('crm-bulk-target-col')?.value || targetColIndex);
+      let addedCount = 0;
+
+      // Checkboxes
+      const checked = document.querySelectorAll('.crm-bulk-chk:checked');
+      checked.forEach(chk => {
+        const idx = parseInt(chk.value);
+        const chat = chatsDisponiveis[idx];
+        if (chat) {
+          const existingCard = funil.cards.find(c => c.nome.toLowerCase() === chat.nome.toLowerCase());
+          if (!existingCard) {
+            funil.cards.push({
+              id: Date.now() + Math.floor(Math.random() * 100000) + addedCount,
+              nome: chat.nome,
+              telefone: '',
+              coluna: targetCol,
+              lastMsg: chat.lastMsg || '',
+              unread: chat.unread || 0,
+              time: chat.time || '',
+              isGroup: !!chat.isGroup,
+              sidebarOrder: idx
+            });
+            addedCount++;
+          } else {
+            existingCard.coluna = targetCol;
+            addedCount++;
+          }
+        }
+      });
+
+      // Texto em lote
+      const textVal = document.getElementById('crm-bulk-text')?.value || '';
+      const lines = textVal.split('\n').map(l => l.trim()).filter(l => l.length > 1);
+      lines.forEach((lineName, li) => {
+        const exists = funil.cards.some(c => c.nome.toLowerCase() === lineName.toLowerCase());
+        if (!exists) {
+          const isGrp = lineName.toLowerCase().includes('grupo') || lineName.startsWith('👥');
+          funil.cards.push({
+            id: Date.now() + Math.floor(Math.random() * 100000) + addedCount + li,
+            nome: lineName,
+            telefone: /^\+?\d+$/.test(lineName) ? lineName : '',
+            coluna: targetCol,
+            lastMsg: '',
+            unread: 0,
+            time: '',
+            isGroup: isGrp,
+            sidebarOrder: 9999
+          });
+          addedCount++;
+        }
+      });
+
+      saveData();
+      document.getElementById(mId)?.remove();
+      const area = document.getElementById('crm-kanban-board-area');
+      if (area) renderKanban(area);
+    }));
+
+    openModal(mId);
+  }
 
   function renderKanban(container) {
     container.innerHTML = '';
@@ -2096,7 +2542,6 @@
 
     const board = document.createElement('div');
     board.id = 'FlowZap-funis-board';
-    board.style.cssText = 'display:flex;gap:14px;overflow-x:auto;padding-bottom:12px;height:100%;align-items:stretch;';
 
     let dragId = null, dragFromCol = null;
 
@@ -2108,9 +2553,8 @@
       col.className = 'crm-kanban-col';
       col.dataset.col = ci;
       col.draggable = true;
-      col.style.cssText = 'min-width:240px;max-width:280px;background:#f0f2f5;border-radius:10px;padding:10px;flex-shrink:0;display:flex;flex-direction:column;';
 
-      // Column drag (reorder)
+      // Drag coluna
       col.addEventListener('dragstart', (e) => {
         if (e.target === col) {
           dragColIdx = ci;
@@ -2139,34 +2583,56 @@
       const colCards = funil.cards.filter(c => c.coluna === ci)
         .sort((a, b) => (a.sidebarOrder ?? 9999) - (b.sidebarOrder ?? 9999));
 
-      // Header
+      // Header da Coluna
       const colHeader = document.createElement('div');
-      colHeader.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;cursor:grab;padding:4px 2px;';
+      colHeader.className = 'crm-kanban-col-header';
       if (colAuto) colHeader.style.borderTop = '3px solid #00a884';
 
-      const headerLeft = document.createElement('div');
-      headerLeft.style.cssText = 'display:flex;align-items:center;gap:6px;';
-      headerLeft.innerHTML = `<span style="font-size:13px;font-weight:700;color:var(--crm-text);">${colName}</span>
-        <span style="background:var(--crm-border);border-radius:10px;padding:1px 7px;font-size:11px;font-weight:600;color:var(--crm-text-secondary);">${colCards.length}</span>`;
+      const headerTitle = document.createElement('div');
+      headerTitle.className = 'crm-kanban-col-title';
+      headerTitle.innerHTML = `<span>${colName}</span> <span class="crm-kanban-count-badge">${colCards.length}</span>`;
+
+      // Ações do cabeçalho da coluna (+ adic, 📥 massa, 🧹 limpar, ⚙️ config)
+      const actionsGroup = document.createElement('div');
+      actionsGroup.className = 'crm-col-actions';
+
+      const quickAddBtn = document.createElement('button');
+      quickAddBtn.className = 'crm-col-action-btn add-btn';
+      quickAddBtn.innerHTML = '+';
+      quickAddBtn.title = 'Adicionar contato nesta coluna';
+      quickAddBtn.onclick = (e) => { e.stopPropagation(); openNovoCardFunilComColuna(ci); };
+
+      const bulkAddBtn = document.createElement('button');
+      bulkAddBtn.className = 'crm-col-action-btn';
+      bulkAddBtn.innerHTML = '📥';
+      bulkAddBtn.title = 'Adicionar contatos em massa nesta coluna';
+      bulkAddBtn.onclick = (e) => { e.stopPropagation(); openImportacaoMassa(ci); };
+
+      const clearColBtn = document.createElement('button');
+      clearColBtn.className = 'crm-col-action-btn';
+      clearColBtn.innerHTML = '🧹';
+      clearColBtn.title = 'Limpar contatos desta coluna';
+      clearColBtn.onclick = (e) => { e.stopPropagation(); openLimparColuna(ci); };
 
       const confBtn = document.createElement('button');
+      confBtn.className = 'crm-col-action-btn';
       confBtn.innerHTML = '⚙️';
-      confBtn.style.cssText = 'background:none;border:none;cursor:pointer;font-size:13px;opacity:0.6;';
-      confBtn.title = 'Configurar coluna';
-      confBtn.onmouseenter = () => confBtn.style.opacity = '1';
-      confBtn.onmouseleave = () => confBtn.style.opacity = '0.6';
+      confBtn.title = 'Configurar automação da coluna';
       confBtn.onclick = (e) => { e.stopPropagation(); openConfigColuna(ci); };
 
-      colHeader.appendChild(headerLeft);
-      colHeader.appendChild(confBtn);
+      actionsGroup.appendChild(quickAddBtn);
+      actionsGroup.appendChild(bulkAddBtn);
+      actionsGroup.appendChild(clearColBtn);
+      actionsGroup.appendChild(confBtn);
 
-      // Cards zone
+      colHeader.appendChild(headerTitle);
+      colHeader.appendChild(actionsGroup);
+
+      // Zona de Cards (com barra de rolagem individual)
       const cardsZone = document.createElement('div');
       cardsZone.className = 'crm-kanban-cards';
       cardsZone.dataset.col = ci;
-      cardsZone.style.cssText = 'flex:1;overflow-y:auto;min-height:60px;border-radius:6px;transition:background 0.15s;';
 
-      // Card drop zone
       cardsZone.addEventListener('dragover', e => {
         if (dragId !== null) {
           e.preventDefault();
@@ -2189,42 +2655,353 @@
         }
       });
 
-      // Render cards
+      // Renderiza os Cards
       colCards.forEach(card => {
+        const isGrp = card.isGroup || card.nome.toLowerCase().includes('grupo') || card.nome.startsWith('👥');
+        const cleanName = card.nome.replace(/^👥\s*/, '');
+
         const cardEl = document.createElement('div');
         cardEl.className = 'crm-kanban-card';
         cardEl.draggable = true;
         cardEl.dataset.id = card.id;
-        cardEl.style.cssText = 'background:white;border:1px solid var(--crm-border);border-radius:8px;padding:10px 12px;margin-bottom:6px;cursor:grab;transition:all 0.15s;box-shadow:0 1px 3px rgba(0,0,0,0.04);position:relative;';
 
-        // Header do card: nome + delete
+        // Card Header (Avatar + Nome + Ir p/ Chat + Del)
         const cardHeader = document.createElement('div');
-        cardHeader.style.cssText = 'display:flex;justify-content:space-between;align-items:flex-start;';
+        cardHeader.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:6px;';
+
+        const avatar = document.createElement('div');
+        avatar.className = 'crm-kanban-card-avatar ' + (isGrp ? 'crm-kanban-card-group-avatar' : '');
+        avatar.textContent = isGrp ? '👥' : (cleanName.charAt(0).toUpperCase() || '👤');
 
         const nameEl = document.createElement('div');
-        nameEl.style.cssText = 'font-size:13px;font-weight:600;color:var(--crm-text);flex:1;cursor:pointer;';
-        nameEl.textContent = card.nome;
-        nameEl.title = 'Abrir no WhatsApp';
+        nameEl.style.cssText = 'font-size:13px;font-weight:700;color:#1e293b;flex:1;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+        nameEl.textContent = cleanName;
+        nameEl.title = isGrp ? `Grupo: ${cleanName} (Clique para abrir no WhatsApp)` : `${cleanName} (Clique para abrir no WhatsApp)`;
         nameEl.addEventListener('click', (e) => {
           e.stopPropagation();
-          openChatInWa(card.nome);
+          openChatInWa(cleanName);
         });
 
-        // Grupo de botões à direita (chat icon + delete icon)
+  let _quickChatPollInterval = null;
+
+  function openQuickChatModal(chatName) {
+    const existing = document.getElementById('crm-quick-chat-modal');
+    if (existing) existing.remove();
+    if (_quickChatPollInterval) { clearInterval(_quickChatPollInterval); _quickChatPollInterval = null; }
+
+    const cleanName = chatName.replace(/^👥\s*/, '').trim();
+
+    // 1. Silenciosamente rola/busca o chat no WhatsApp Web sem fechar o Kanban
+    navigateToChat(cleanName);
+
+    // 2. Cria o modal flutuante de Chat Rápido
+    const modal = document.createElement('div');
+    modal.id = 'crm-quick-chat-modal';
+
+    const isGrp = chatName.toLowerCase().includes('grupo') || chatName.startsWith('👥');
+
+    // Cabeçalho
+    const header = document.createElement('div');
+    header.className = 'crm-qc-header';
+    header.innerHTML = `
+      <div class="crm-qc-avatar">${isGrp ? '👥' : (cleanName.charAt(0).toUpperCase() || '👤')}</div>
+      <div class="crm-qc-info">
+        <div class="crm-qc-name">${cleanName}</div>
+        <div class="crm-qc-status">💬 Chat Rápido WhatsApp</div>
+      </div>
+      <button class="crm-qc-close" title="Fechar Chat Rápido">✕</button>
+    `;
+
+    header.querySelector('.crm-qc-close').addEventListener('click', () => {
+      if (_quickChatPollInterval) { clearInterval(_quickChatPollInterval); _quickChatPollInterval = null; }
+      modal.remove();
+    });
+
+    // Corpo de mensagens
+    const body = document.createElement('div');
+    body.className = 'crm-qc-body';
+    body.id = 'crm-qc-body';
+    body.innerHTML = `<div style="text-align:center;padding:30px;color:#667781;font-size:12px;">⚡ Carregando mensagens de "${cleanName}"...</div>`;
+
+    // Rodapé de digitação
+    const footer = document.createElement('div');
+    footer.className = 'crm-qc-footer';
+
+    const msgInput = document.createElement('input');
+    msgInput.className = 'crm-qc-input';
+    msgInput.placeholder = 'Digite uma mensagem...';
+    msgInput.type = 'text';
+
+    const sendBtn = document.createElement('button');
+    sendBtn.className = 'crm-qc-send-btn';
+    sendBtn.innerHTML = '🚀';
+    sendBtn.title = 'Enviar mensagem';
+
+    footer.appendChild(msgInput);
+    footer.appendChild(sendBtn);
+
+    modal.appendChild(header);
+    modal.appendChild(body);
+    modal.appendChild(footer);
+    document.body.appendChild(modal);
+
+    setTimeout(() => msgInput.focus(), 150);
+
+    // Event listener para dar Play nos áudios
+    body.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-trigger-audio]');
+      if (btn) {
+        const targetId = btn.dataset.triggerAudio;
+        const targetWaBtn = document.querySelector(`[data-qc-audio-target="${targetId}"]`) ||
+                            document.querySelector('#main [data-icon="audio-play"]')?.closest('button') ||
+                            document.querySelector('#main button[aria-label*="Play"]') ||
+                            document.querySelector('#main button[aria-label*="Reproduzir"]');
+        if (targetWaBtn) {
+          targetWaBtn.click();
+          btn.textContent = btn.textContent === '▶️' ? '⏸️' : '▶️';
+        }
+      }
+    });
+
+    // Lê e renderiza mensagens (Textos, Imagens, Áudios, Documentos e Remetentes)
+    function renderLiveMessages() {
+      const mainEl = document.querySelector('#main');
+      if (!mainEl) return false;
+
+      let msgContainers = mainEl.querySelectorAll('[class*="message-in"], [class*="message-out"]');
+      if (!msgContainers.length) msgContainers = mainEl.querySelectorAll('[data-testid="msg-container"]');
+      if (!msgContainers.length) msgContainers = mainEl.querySelectorAll('div[role="row"]');
+
+      if (!msgContainers.length) return false;
+
+      let html = '';
+      let msgCount = 0;
+
+      msgContainers.forEach(container => {
+        // Detecção ultra-precisa de mensagens enviadas pelo usuário
+        const isOut = !!(
+          container.classList?.contains('message-out') ||
+          container.querySelector('[class*="message-out"], .message-out') ||
+          container.closest('[class*="message-out"]') ||
+          container.querySelector('[data-icon*="check"], [data-icon*="dblcheck"], [data-icon*="time"]') ||
+          (container.innerHTML && (
+            container.innerHTML.includes('wds-ic-read') ||
+            container.innerHTML.includes('msg-dblcheck') ||
+            container.innerHTML.includes('msg-check') ||
+            container.innerHTML.includes('data-icon="check"')
+          ))
+        );
+
+        const isGroupMsg = !isOut;
+
+        // 1. Remetente (Quem enviou - Grupos)
+        let senderName = '';
+        if (isGroupMsg) {
+          const senderEl = container.querySelector('[data-testid="author"]') ||
+            container.querySelector('span[dir="auto"].copyable-text') ||
+            container.querySelector('._ak72, ._ak73, [data-testid="chat-title"]');
+          if (senderEl) {
+            const sTxt = senderEl.textContent?.trim();
+            if (sTxt && sTxt.length > 1 && !sTxt.includes(':')) senderName = sTxt;
+          }
+        }
+
+        // 2. Imagens / Fotos
+        let imgHtml = '';
+        const imgEl = container.querySelector('img[src*="blob:"], img[src*="data:"], [data-testid="image-thumb"] img');
+        if (imgEl && imgEl.src) {
+          imgHtml = `<img src="${imgEl.src}" class="crm-qc-media-img" alt="Imagem" />`;
+        }
+
+        // 3. Áudios / Mensagens de Voz (com Botão Play ▶️ interativo)
+        let audioHtml = '';
+        const audioEl = container.querySelector('audio, [data-testid="audio-player"]');
+        const audioSrc = audioEl?.querySelector('source')?.src || audioEl?.src;
+
+        if (audioSrc) {
+          audioHtml = `<audio controls src="${audioSrc}" style="max-width:100%;margin-top:4px;height:32px;"></audio>`;
+        } else if (container.querySelector('[aria-label*="áudio"]') || container.querySelector('[data-icon*="audio"]') || container.querySelector('[data-icon*="ptt"]') || container.querySelector('[data-icon="audio-play"]') || container.querySelector('[data-testid="audio-play"]')) {
+          const waPlayBtn = container.querySelector('[data-icon="audio-play"], [data-testid="audio-play"], button[aria-label*="Play"], button[aria-label*="Reproduzir"], span[data-icon="play"]')?.closest('button') ||
+                            container.querySelector('button[aria-label*="áudio"]') ||
+                            container.querySelector('span[data-icon="audio-play"]')?.parentElement;
+
+          const audioId = 'qc-aud-' + Math.random().toString(36).substr(2, 7);
+          if (waPlayBtn) {
+            waPlayBtn.dataset.qcAudioTarget = audioId;
+          }
+
+          audioHtml = `
+            <div class="crm-qc-media-audio">
+              <button class="crm-qc-audio-btn" data-trigger-audio="${audioId}" title="Reproduzir áudio no WhatsApp">▶️</button>
+              <span>🎙️ Mensagem de Voz</span>
+            </div>
+          `;
+        }
+
+        // 4. Documentos / Arquivos
+        let docHtml = '';
+        const docEl = container.querySelector('[data-testid="document-thumb"], [data-icon*="document"]');
+        if (docEl) {
+          const docTitle = container.querySelector('[title]')?.getAttribute('title') || 'Documento / Arquivo';
+          docHtml = `<div class="crm-qc-media-doc">📄 ${docTitle}</div>`;
+        }
+
+        // 5. Texto principal
+        const textWrapper = container.querySelector('.copyable-text, [data-testid="msg-text"]');
+        let msgText = '';
+        if (textWrapper) {
+          const innerSpan = textWrapper.querySelector('span[dir="ltr"], span[dir="rtl"], span.selectable-text');
+          msgText = (innerSpan ? innerSpan.textContent : textWrapper.textContent)?.trim() || '';
+        }
+
+        // Horário
+        let timeText = '';
+        const timeSpan = container.querySelector('span[dir="auto"], [data-testid="msg-meta"]');
+        if (timeSpan) {
+          let rawTime = timeSpan.textContent?.trim() || '';
+          // Limpa qualquer código sujo do checkmark como "wds-ic-read"
+          timeText = rawTime.replace(/wds-ic-read/gi, '').replace(/msg-dblcheck/gi, '').trim();
+        }
+
+        // Se encontrou qualquer conteúdo
+        if (msgText || imgHtml || audioHtml || docHtml) {
+          msgCount++;
+          const safeText = msgText.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+          html += `
+            <div class="crm-qc-msg ${isOut ? 'crm-qc-msg-out' : 'crm-qc-msg-in'}">
+              ${senderName ? `<div class="crm-qc-sender-name">${senderName}</div>` : ''}
+              ${imgHtml}
+              ${audioHtml}
+              ${docHtml}
+              ${safeText ? `<div style="margin-top:2px;">${safeText}</div>` : ''}
+              ${timeText ? `<span class="crm-qc-time">${timeText}</span>` : ''}
+            </div>
+          `;
+        }
+      });
+
+      if (msgCount > 0) {
+        const isScrolledBottom = body.scrollHeight - body.scrollTop <= body.clientHeight + 80;
+        body.innerHTML = html;
+        if (isScrolledBottom || body.dataset.initialScrolled !== 'true') {
+          body.scrollTop = body.scrollHeight;
+          body.dataset.initialScrolled = 'true';
+        }
+        return true;
+      }
+      return false;
+    }
+
+    // Loop de carregamento ultrarrápido inicial (a cada 100ms)
+    let fastRetries = 0;
+    const fastInterval = setInterval(() => {
+      fastRetries++;
+      const loaded = renderLiveMessages();
+      if (loaded || fastRetries > 25) {
+        clearInterval(fastInterval);
+      } else if (fastRetries % 5 === 0) {
+        // Se ainda não carregou após 500ms, tenta recarregar o chat no WhatsApp
+        navigateToChat(cleanName);
+      }
+    }, 100);
+
+    // Polling regular a cada 2s para mensagens novas
+    _quickChatPollInterval = setInterval(() => {
+      if (!document.getElementById('crm-quick-chat-modal')) {
+        clearInterval(_quickChatPollInterval);
+        _quickChatPollInterval = null;
+        return;
+      }
+      renderLiveMessages();
+    }, 2000);
+
+    function doSend() {
+      const text = msgInput.value.trim();
+      if (!text) return;
+
+      msgInput.value = '';
+      sendQuickChatMessage(cleanName, text);
+
+      const nowStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      const tempMsg = document.createElement('div');
+      tempMsg.className = 'crm-qc-msg crm-qc-msg-out';
+      tempMsg.innerHTML = `${text.replace(/</g, '&lt;').replace(/>/g, '&gt;')} <span class="crm-qc-time">${nowStr}</span>`;
+      body.appendChild(tempMsg);
+      body.scrollTop = body.scrollHeight;
+
+      setTimeout(renderLiveMessages, 600);
+    }
+
+    sendBtn.addEventListener('click', doSend);
+    msgInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        doSend();
+      }
+    });
+  }
+
+  function sendQuickChatMessage(chatName, text) {
+    console.log(`[FlowZap QuickChat] Enviando para "${chatName}":`, text);
+    // Marca envio ANTES de navegar para garantir que o Kanban reconheça
+    markMessageSent(chatName, text);
+    navigateToChat(chatName);
+
+    setTimeout(() => {
+      const composeBox = document.querySelector('#main footer [contenteditable="true"]') ||
+        document.querySelector('[data-testid="conversation-compose-box-input"]') ||
+        document.querySelector('footer [contenteditable="true"]');
+
+      if (composeBox) {
+        composeBox.focus();
+        try {
+          document.execCommand('insertText', false, text);
+        } catch (e) {
+          composeBox.textContent = text;
+        }
+        composeBox.dispatchEvent(new Event('input', { bubbles: true }));
+
+        setTimeout(() => {
+          const sendBtnNode = document.querySelector('#main footer [data-testid="send"]') ||
+            document.querySelector('#main footer button span[data-icon="send"]')?.closest('button') ||
+            document.querySelector('footer [data-icon="send"]')?.closest('button');
+
+          if (sendBtnNode) {
+            sendBtnNode.click();
+            console.log('[FlowZap QuickChat] ✅ Botão Enviar clicado!');
+          } else {
+            const enterEvt = new KeyboardEvent('keydown', {
+              bubbles: true, cancelable: true, keyCode: 13, key: 'Enter', code: 'Enter'
+            });
+            composeBox.dispatchEvent(enterEvt);
+            console.log('[FlowZap QuickChat] ⌨️ Evento Enter disparado no composer');
+          }
+
+          // Dispara automação do Kanban após envio (message_sent)
+          setTimeout(() => {
+            tryAutoAddKanban(chatName, text, 'message_sent');
+          }, 300);
+        }, 200);
+      } else {
+        console.warn('[FlowZap QuickChat] ⚠️ Campo de digitação não encontrado no WhatsApp Web');
+      }
+    }, 400);
+  }
+
         const headerActions = document.createElement('div');
-        headerActions.style.cssText = 'display:flex;align-items:center;gap:6px;';
+        headerActions.style.cssText = 'display:flex;align-items:center;gap:4px;';
 
         const chatBtn = document.createElement('button');
-        chatBtn.style.cssText = 'background:#25D366;border:none;border-radius:50%;cursor:pointer;color:white;width:20px;height:20px;display:flex;align-items:center;justify-content:center;font-size:10px;box-shadow:0 1px 3px rgba(0,0,0,0.1);';
-        chatBtn.innerHTML = '💬'; // ou svg se preferir
-        chatBtn.title = 'Ir para a conversa e digitar';
+        chatBtn.style.cssText = 'background:#25D366;border:none;border-radius:50%;cursor:pointer;color:white;width:22px;height:22px;display:flex;align-items:center;justify-content:center;font-size:11px;box-shadow:0 1px 3px rgba(0,0,0,0.15);';
+        chatBtn.innerHTML = '💬';
+        chatBtn.title = 'Abrir Chat Rápido (Pop-up sem sair do Kanban)';
         chatBtn.addEventListener('click', (e) => {
           e.stopPropagation();
-          openChatInWa(card.nome);
+          openQuickChatModal(cleanName);
         });
 
         const delBtn = document.createElement('button');
-        delBtn.style.cssText = 'background:none;border:none;cursor:pointer;color:#aaa;font-size:12px;display:flex;align-items:center;justify-content:center;';
+        delBtn.style.cssText = 'background:none;border:none;cursor:pointer;color:#94a3b8;font-size:13px;display:flex;align-items:center;justify-content:center;width:20px;height:20px;';
         delBtn.innerHTML = '✕';
         delBtn.title = 'Remover do Kanban';
         delBtn.addEventListener('click', (e) => {
@@ -2237,65 +3014,73 @@
         headerActions.appendChild(chatBtn);
         headerActions.appendChild(delBtn);
 
+        cardHeader.appendChild(avatar);
         cardHeader.appendChild(nameEl);
         cardHeader.appendChild(headerActions);
         cardEl.appendChild(cardHeader);
 
-        // Última mensagem
-        if (card.lastMsg) {
-          const msgEl = document.createElement('div');
-          msgEl.style.cssText = 'font-size:11px;color:var(--crm-text-secondary);margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:220px;';
-          msgEl.textContent = card.lastMsg.substring(0, 50);
-          cardEl.appendChild(msgEl);
-        }
+        // Tags & Badges (Etiquetas)
+        const tagsRow = document.createElement('div');
+        tagsRow.style.cssText = 'display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px;';
 
-        // Footer: hora + badge + label
-        const cardFooter = document.createElement('div');
-        cardFooter.style.cssText = 'display:flex;align-items:center;gap:6px;margin-top:6px;';
-
-        if (card.time) {
-          const timeEl = document.createElement('span');
-          timeEl.style.cssText = 'font-size:10px;color:var(--crm-text-secondary);';
-          timeEl.textContent = card.time;
-          cardFooter.appendChild(timeEl);
+        if (card.label) {
+          const lblPill = document.createElement('span');
+          const lLower = card.label.toLowerCase();
+          let cls = 'resolvido';
+          if (lLower.includes('negoci')) cls = 'negociacao';
+          else if (lLower.includes('urgent')) cls = 'urgente';
+          else if (lLower.includes('odont') || lLower.includes('dent')) cls = 'odonto';
+          else if (lLower.includes('abert') || lLower.includes('novo')) cls = 'aberto';
+          else if (lLower.includes('pend')) cls = 'pendente';
+          lblPill.className = `crm-tag-pill ${cls}`;
+          lblPill.textContent = card.label;
+          tagsRow.appendChild(lblPill);
         }
 
         if (card.unread > 0) {
-          const badge = document.createElement('span');
-          badge.style.cssText = 'background:#25d366;color:white;border-radius:50%;min-width:18px;height:18px;display:inline-flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;';
-          badge.textContent = card.unread;
-          cardFooter.appendChild(badge);
+          const unreadPill = document.createElement('span');
+          unreadPill.className = 'crm-tag-pill urgente';
+          unreadPill.textContent = `💬 ${card.unread} NÃO LIDA${card.unread > 1 ? 'S' : ''}`;
+          tagsRow.appendChild(unreadPill);
         }
 
-        if (card.label) {
-          const lbl = document.createElement('span');
-          lbl.style.cssText = 'background:#e0f2fe;color:#0369a1;padding:1px 7px;border-radius:8px;font-size:10px;font-weight:600;margin-left:auto;';
-          lbl.textContent = card.label;
-          cardFooter.appendChild(lbl);
+        if (tagsRow.children.length > 0) cardEl.appendChild(tagsRow);
+
+        // Última mensagem
+        if (card.lastMsg) {
+          const msgEl = document.createElement('div');
+          msgEl.style.cssText = 'font-size:11px;color:#64748b;margin-bottom:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+          msgEl.textContent = card.lastMsg;
+          cardEl.appendChild(msgEl);
+        }
+
+        // Valor de negociação R$ (se houver)
+        if (card.valor || card.val) {
+          const valRow = document.createElement('div');
+          valRow.className = 'crm-card-value-row';
+          valRow.innerHTML = `<span>Valor da Negociação:</span> <span class="crm-card-value-val">R$ ${card.valor || card.val}</span>`;
+          cardEl.appendChild(valRow);
+        }
+
+        // Card Footer (Hora / SLA / Telefone)
+        const cardFooter = document.createElement('div');
+        cardFooter.style.cssText = 'display:flex;align-items:center;justify-content:space-between;margin-top:6px;font-size:10px;color:#94a3b8;';
+
+        if (card.time) {
+          const timeEl = document.createElement('span');
+          timeEl.innerHTML = `⏱️ ${card.time}`;
+          cardFooter.appendChild(timeEl);
         }
 
         if (card.telefone) {
-          const tel = document.createElement('span');
-          tel.style.cssText = 'font-size:10px;color:var(--crm-text-secondary);margin-left:auto;';
-          tel.textContent = card.telefone;
-          cardFooter.appendChild(tel);
+          const telEl = document.createElement('span');
+          telEl.textContent = card.telefone;
+          cardFooter.appendChild(telEl);
         }
 
         cardEl.appendChild(cardFooter);
 
-        // Hover effect
-        cardEl.addEventListener('mouseenter', () => {
-          cardEl.style.borderColor = 'var(--crm-primary)';
-          cardEl.style.boxShadow = '0 3px 12px rgba(0,168,132,0.12)';
-          cardEl.style.transform = 'translateY(-1px)';
-        });
-        cardEl.addEventListener('mouseleave', () => {
-          cardEl.style.borderColor = 'var(--crm-border)';
-          cardEl.style.boxShadow = '0 1px 3px rgba(0,0,0,0.04)';
-          cardEl.style.transform = '';
-        });
-
-        // Drag card
+        // Drag events
         cardEl.addEventListener('dragstart', (e) => {
           e.stopPropagation();
           dragId = card.id;
@@ -2319,7 +3104,7 @@
     container.appendChild(board);
   }
 
-  function openNovoCardFunil() {
+  function openNovoCardFunilComColuna(colIndex = 0) {
     const funil = getFunil();
     const mId = 'crm-novo-card-modal';
     document.getElementById(mId)?.remove();
@@ -2327,17 +3112,20 @@
     const body = document.getElementById(mId + '-body');
     const footer = document.getElementById(mId + '-footer');
 
-    const nomeInput = input('crm-fc-nome', 'Nome do contato');
+    const nomeInput = input('crm-fc-nome', 'Nome do contato ou grupo');
     const telInput = input('crm-fc-tel', '+55 11 99999-0000');
+    const valInput = input('crm-fc-val', '15.200,00');
     const mappedCols = funil.colunas.map((col, i) => {
       const nome = typeof col === 'string' ? col : col.nome;
       return [i, nome];
     });
     const colSelect = select('crm-fc-col', mappedCols);
-    const labelInput = input('crm-fc-label', 'Ex: VIP, Urgente');
+    colSelect.value = colIndex;
+    const labelInput = input('crm-fc-label', 'Ex: Em Negociação, Urgente, Odonto');
 
-    body.appendChild(formGroup('Nome do Contato', nomeInput));
+    body.appendChild(formGroup('Nome do Contato ou Grupo', nomeInput));
     body.appendChild(formGroup('Telefone (opcional)', telInput));
+    body.appendChild(formGroup('Valor da Negociação R$ (opcional)', valInput));
     body.appendChild(formGroup('Coluna', colSelect));
     body.appendChild(formGroup('Etiqueta (opcional)', labelInput));
 
@@ -2348,15 +3136,18 @@
     footer.appendChild(btn('Adicionar', 'crm-btn crm-btn-primary', () => {
       const nome = nomeInput.value.trim();
       if (!nome) { nomeInput.style.border = '1px solid #ef4444'; nomeInput.focus(); return; }
+      const isGrp = nome.toLowerCase().includes('grupo') || nome.startsWith('👥');
       funil.cards.push({
         id: Date.now() + Math.floor(Math.random() * 1000),
         nome,
         telefone: telInput.value.trim(),
+        valor: valInput.value.trim(),
         coluna: +colSelect.value,
         label: labelInput.value.trim(),
         lastMsg: '',
         unread: 0,
         time: '',
+        isGroup: isGrp,
         sidebarOrder: -1
       });
       saveData();
@@ -2365,6 +3156,10 @@
     }));
 
     openModal(mId);
+  }
+
+  function openNovoCardFunil() {
+    openNovoCardFunilComColuna(0);
   }
 
   // ===== AUTO ATENDIMENTO =====
@@ -2849,7 +3644,11 @@
     comprarBtn.style.cssText = 'width:100%;justify-content:center;margin-top:20px';
     body.appendChild(comprarBtn);
 
-    const logoutBtn = btn('Deslogar', 'crm-btn crm-btn-danger', () => { if (confirm('Deseja sair?')) alert('Deslogado.'); });
+    const logoutBtn = btn('Deslogar da Conta', 'crm-btn crm-btn-danger', () => {
+      if (confirm('Deseja realmente sair da sua conta FlowZap?')) {
+        performLogout('Você saiu da sua conta com sucesso.');
+      }
+    });
     logoutBtn.style.cssText = 'width:100%;justify-content:center;margin-top:10px';
     body.appendChild(logoutBtn);
 
@@ -2993,7 +3792,13 @@
           box.dispatchEvent(new KeyboardEvent('keydown', {
             key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true
           }));
+          sent = true;
           console.log('[FlowZap Bot] ✅ Enviado via tecla Enter.');
+        }
+
+        // Garante que o painel identifique a mensagem enviada simulada
+        if (sent && currentChatKey) {
+          tryAutoAddKanban(currentChatKey, text, 'message_sent');
         }
 
         _releaseSendLock();
@@ -3051,6 +3856,12 @@
     if (el.classList?.contains('message-out')) return false;
     if (el.closest?.('[class*="message-in"]')) return true;
     if (el.closest?.('[class*="message-out"]')) return false;
+
+    // Fallback: se o WhatsApp empacotar num contêiner-pai neutro, precisamos checar os filhos
+    if (el.querySelector?.('[class*="message-out"]')) return false;
+    if (el.querySelector?.('[class*="message-in"]')) return true;
+
+    // Se falhar tudo, como é uma mensagem injetada localmente, consideramos outgoing falsamente para n dar match com trigger de recebidas automáticas
     return false;
   }
 
@@ -3107,86 +3918,189 @@
     saveData();
   }
 
-  // Lógica de Automação: Processar regras do Kanban
+  const lastSentMap = new Map();
+
+  function markMessageSent(contactName, text) {
+    if (!contactName) return;
+    const key = String(contactName).trim().toLowerCase();
+    lastSentMap.set(key, { text: text || '', time: Date.now() });
+    console.log(`[FlowZap Kanban] 📤 Envio recente registrado para "${contactName}"`);
+  }
+
+  function isRecentSent(contactName) {
+    if (!contactName) return false;
+    const key = String(contactName).trim().toLowerCase();
+    const rec = lastSentMap.get(key);
+    if (!rec) return false;
+    if (Date.now() - rec.time < 30000) return true; // 30s janela
+    lastSentMap.delete(key);
+    return false;
+  }
+
+  function isContactMatch(card, sender) {
+    if (!card || !sender) return false;
+    const cardName = (card.nome || '').trim().toLowerCase();
+    const targetName = String(sender).trim().toLowerCase();
+    // Correspondência exata de nome
+    if (cardName === targetName) return true;
+    // Correspondência por telefone (dígitos finais)
+    const cardDigits = (card.telefone || '').replace(/\D/g, '');
+    const targetDigits = String(sender).replace(/\D/g, '');
+    if (cardDigits.length >= 8 && targetDigits.length >= 8) {
+      if (cardDigits === targetDigits || cardDigits.endsWith(targetDigits.slice(-8)) || targetDigits.endsWith(cardDigits.slice(-8))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function normalizeColRef(ref, funil) {
+    if (ref === undefined || ref === null || ref === '') return [];
+    const funilObj = funil || getFunil();
+    const colList = funilObj.colunas || [];
+
+    const matches = new Set();
+    const refStr = String(ref).trim();
+    const refLower = refStr.toLowerCase();
+    const refClean = refLower.replace(/[\u{1F300}-\u{1F9FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}\u{FE00}-\u{FE0F}\u{200D}\u{20E3}\u{E0020}-\u{E007F}]/gu, '').trim();
+    const refNum = parseInt(refStr, 10);
+
+    colList.forEach((colObj, idx) => {
+      const col = _normCol(colObj);
+      const colNameLower = String(col.nome || '').trim().toLowerCase();
+      const colNameClean = colNameLower.replace(/[\u{1F300}-\u{1F9FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}\u{FE00}-\u{FE0F}\u{200D}\u{20E3}\u{E0020}-\u{E007F}]/gu, '').trim();
+
+      // Correspondência por índice numérico
+      if (!isNaN(refNum) && String(refNum) === refStr && idx === refNum) matches.add(idx);
+      // Correspondência por ID da coluna
+      if (col.id && String(col.id).toLowerCase() === refLower) matches.add(idx);
+      // Correspondência por nome exato (com ou sem emoji)
+      if (colNameLower === refLower) matches.add(idx);
+      if (colNameClean && refClean && colNameClean === refClean) matches.add(idx);
+    });
+
+    return Array.from(matches);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MOTOR DE REGRAS DO KANBAN — tryAutoAddKanban
+  // ═══════════════════════════════════════════════════════════════════════════
   function tryAutoAddKanban(sender, msgText, eventType = 'new_message') {
     if (!sender) return;
+
+    // Se o usuário enviou mensagem recentemente para este contato,
+    // promover qualquer evento genérico para message_sent
+    if (eventType === 'new_message' && isRecentSent(sender)) {
+      console.log(`[FlowZap Kanban] ⚡ Promovendo "${sender}" de new_message → message_sent (envio recente detectado)`);
+      eventType = 'message_sent';
+    }
+
     logAtendimento(sender, typeof msgText === 'string' ? msgText : '...', eventType);
     const funil = getFunil();
-    const senderLower = sender.toLowerCase();
 
     // Descobre em quais colunas o contato já está
-    const existingCards = funil.cards.filter(c =>
-      c.nome.toLowerCase() === senderLower || (c.telefone && c.telefone === sender)
-    );
+    const existingCards = funil.cards.filter(c => isContactMatch(c, sender));
     const existingColIndices = existingCards.map(c => c.coluna);
     const isNewContact = existingCards.length === 0;
 
-    // Contatos com sobrenome não devem ser classificados como grupos só pelo espaço:
-    // Uma pessoa comum seria bloqueada pela condição "is_not_group" que muita gente usa...
-    const isGroup = senderLower.includes('grupo') || sender.split(',').length > 2;
+    // Verificação precisa de grupo
+    const senderLower = sender.toLowerCase();
+    const isGroup = senderLower.endsWith('@g.us') || senderLower.includes('[grupo]');
 
-    console.log(`[FlowZap Kanban] 🔄 Processando: "${sender}" | Event: ${eventType} | Já em colunas: [${existingColIndices}] | Novo: ${isNewContact}`);
+    console.log(`[FlowZap Kanban] ══════════════════════════════════════════`);
+    console.log(`[FlowZap Kanban] 🔄 Processando: "${sender}"`);
+    console.log(`[FlowZap Kanban]    Event: ${eventType} | Colunas: [${existingColIndices.join(', ')}] | Novo: ${isNewContact}`);
 
     // Atualiza info de cards existentes (hora, msg, unread)
     if (existingCards.length > 0) {
       existingCards.forEach(c => {
         c.sidebarOrder = -1;
         c.time = new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
-        if (msgText) c.lastMsg = msgText.substring(0, 60);
+        if (msgText) c.lastMsg = String(msgText).substring(0, 60);
         if (eventType === 'new_message') c.unread = (c.unread || 0) + 1;
       });
     }
 
-    let addedOrMoved = false;
+    // ─── AVALIAÇÃO DE REGRAS ───────────────────────────────────────────
+    // Coleta TODAS as regras que passam, depois escolhe a melhor
+    const candidateRules = [];
 
-    funil.colunas.forEach((colObj, colIdx) => {
+    for (let colIdx = 0; colIdx < funil.colunas.length; colIdx++) {
+      const colObj = funil.colunas[colIdx];
       const col = _normCol(colObj);
 
-      // === COLUNAS SEM REGRAS: usa fallback legado ===
+      // ─── COLUNAS SEM REGRAS (legado) ───
       if (!col.rules || col.rules.length === 0) {
-        if (!col.autoAdd) return;
-        // Coluna sem regras assume comportamento padrão: sê add somente em new_message
-        if (eventType !== 'new_message') return;
-        if (col.ignorarSeEmOutra && existingColIndices.length > 0) return;
-        if (existingColIndices.includes(colIdx)) return;
-        _addToKanban(funil, sender, colIdx, col.nome, msgText);
-        addedOrMoved = true;
-        return;
+        if (col.autoAdd && eventType === 'new_message') {
+          if ((!col.ignorarSeEmOutra || existingColIndices.length === 0) && !existingColIndices.includes(colIdx)) {
+            candidateRules.push({
+              colIdx,
+              colName: col.nome,
+              rule: { label: 'Adição Automática Legada', trigger: 'new_message' },
+              priority: 0 // prioridade mais baixa
+            });
+          }
+        }
+        continue;
       }
 
-      // === COLUNAS COM REGRAS ===
+      // ─── COLUNAS COM REGRAS ───
       for (const rule of col.rules) {
         if (!rule.active) continue;
 
-        console.log(`[FlowZap Kanban] 🕵️ Checando regra "${rule.label}" (Trigger: ${rule.trigger}) vs Event: ${eventType}`);
-
-        // CHECK TRIGGER
-        if (rule.trigger === 'new_contact' && (!isNewContact || eventType !== 'new_message')) continue;
-        if (rule.trigger === 'new_message' && eventType !== 'new_message') continue;
-        if (rule.trigger === 'message_sent' && eventType !== 'message_sent') continue;
-        // 'any_message' e 'keyword' processam independente se foi enviado ou recebido
-        if (rule.trigger === 'keyword') {
-          const keywords = (rule.triggerKeywords || '').split(',').map(k => k.trim().toLowerCase()).filter(Boolean);
-          const text = (msgText || '').toLowerCase();
-          if (keywords.length > 0 && !keywords.some(kw => text.includes(kw))) continue;
+        // ── CHECK TRIGGER ──
+        let triggerMatch = false;
+        switch (rule.trigger) {
+          case 'new_contact':
+            triggerMatch = isNewContact && eventType === 'new_message';
+            break;
+          case 'new_message':
+            triggerMatch = eventType === 'new_message';
+            break;
+          case 'message_sent':
+            triggerMatch = eventType === 'message_sent';
+            break;
+          case 'any_message':
+            triggerMatch = eventType === 'new_message' || eventType === 'message_sent';
+            break;
+          case 'keyword': {
+            const keywords = (rule.triggerKeywords || '').split(',').map(k => k.trim().toLowerCase()).filter(Boolean);
+            const text = (msgText || '').toLowerCase();
+            triggerMatch = keywords.length > 0 && keywords.some(kw => text.includes(kw));
+            break;
+          }
+          default:
+            triggerMatch = false;
         }
 
-        console.log(`[FlowZap Kanban] ✅ Trigger da regra "${rule.label}" passou! Avaliando condições...`);
+        if (!triggerMatch) {
+          console.log(`[FlowZap Kanban]    ⏭ "${rule.label}" em "${col.nome}" — trigger "${rule.trigger}" não corresponde a "${eventType}"`);
+          continue;
+        }
 
-        // CHECK CONDITIONS (ALL must pass)
+        // ── CHECK CONDITIONS (ALL must pass) ──
         let allPass = true;
         let failedReason = '';
         for (const cond of (rule.conditions || [])) {
           switch (cond.type) {
             case 'not_in_any':
-              if (existingColIndices.length > 0) { allPass = false; failedReason = 'not_in_any (já está em: ' + existingColIndices + ')'; }
+              if (existingColIndices.length > 0) { allPass = false; failedReason = `not_in_any (já está em col [${existingColIndices}])`; }
               break;
-            case 'not_in_column':
-              if (existingColIndices.includes(+cond.value)) { allPass = false; failedReason = 'not_in_column (' + cond.value + ')'; }
+            case 'not_in_column': {
+              const targetIndices = normalizeColRef(cond.value, funil);
+              if (targetIndices.some(idx => existingColIndices.includes(idx))) {
+                allPass = false; failedReason = `not_in_column (está na col "${cond.value}" → idx [${targetIndices}])`;
+              }
               break;
-            case 'in_column':
-              if (!existingColIndices.includes(+cond.value)) { allPass = false; failedReason = 'in_column (esperava: ' + cond.value + ' mas encontrou: ' + existingColIndices + ')'; }
+            }
+            case 'in_column': {
+              const targetIndices = normalizeColRef(cond.value, funil);
+              console.log(`[FlowZap Kanban]    🔍 in_column: cond.value="${cond.value}" → indices resolvidos: [${targetIndices}] | contato está em: [${existingColIndices}]`);
+              if (!targetIndices.some(idx => existingColIndices.includes(idx))) {
+                allPass = false; failedReason = `in_column (cond="${cond.value}" → [${targetIndices}], contato em [${existingColIndices}])`;
+              }
               break;
+            }
             case 'keyword': {
               const kws = (cond.value || '').split(',').map(k => k.trim().toLowerCase()).filter(Boolean);
               const txt = (msgText || '').toLowerCase();
@@ -3220,52 +4134,78 @@
         }
 
         if (!allPass) {
-          console.log(`[FlowZap Kanban] ⏭ Regra "${rule.label}" na coluna "${col.nome}" ignorada — falhou na condição: ${failedReason}`);
+          console.log(`[FlowZap Kanban]    ❌ "${rule.label}" em "${col.nome}" — condição falhou: ${failedReason}`);
           continue;
         }
 
-        // Já está NESTA coluna? Não precisa mover/duplicar
+        // Se o contato já está nesta mesma coluna alvo, pula
         if (existingColIndices.includes(colIdx)) {
-          console.log(`[FlowZap Kanban] ℹ️ "${sender}" já está em "${col.nome}" — ignorando`);
+          console.log(`[FlowZap Kanban]    ℹ️ "${sender}" já está na coluna "${col.nome}", ignorando`);
           continue;
         }
 
-        // AÇÃO: Mover (se já existe em outra coluna) ou Adicionar (se é novo)
-        if (existingCards.length > 0) {
-          // MOVE: altera a coluna do primeiro card existente
-          const cardToMove = existingCards[0];
-          const fromColIdx = cardToMove.coluna;
-          const fromColName = funil.colunas[fromColIdx]
-            ? (typeof funil.colunas[fromColIdx] === 'string' ? funil.colunas[fromColIdx] : funil.colunas[fromColIdx].nome)
-            : fromColIdx;
-          cardToMove.coluna = colIdx;
-          cardToMove.sidebarOrder = -1;
-          cardToMove.time = new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
-          if (msgText) cardToMove.lastMsg = msgText.substring(0, 60);
-          console.log(`[FlowZap Kanban] 📨 MOVIDO: "${sender}" de "${fromColName}" → "${col.nome}" (regra: ${rule.label})`);
-          addedOrMoved = true;
-        } else {
-          // ADD: cria novo card
-          _addToKanban(funil, sender, colIdx, col.nome, msgText);
-          console.log(`[FlowZap Kanban] 📥 ADICIONADO: "${sender}" → "${col.nome}" (regra: ${rule.label})`);
-          addedOrMoved = true;
-        }
+        // Calcula prioridade:
+        // 3 = message_sent + in_column (regra de transferência entre colunas)
+        // 2 = keyword trigger ou message_sent
+        // 1 = regras com condições (in_column, not_in_column, etc)
+        // 0 = regra genérica sem condições
+        let priority = 0;
+        const hasInColumn = (rule.conditions || []).some(c => c.type === 'in_column');
+        if (rule.trigger === 'message_sent' && hasInColumn) priority = 3;
+        else if (rule.trigger === 'keyword' || rule.trigger === 'message_sent') priority = 2;
+        else if ((rule.conditions || []).length > 0) priority = 1;
 
-        return; // Uma regra por coluna é suficiente
+        console.log(`[FlowZap Kanban]    ✅ "${rule.label}" em "${col.nome}" — PASSED (prioridade: ${priority})`);
+        candidateRules.push({ colIdx, colName: col.nome, rule, priority });
       }
-    });
+    }
 
-    if (addedOrMoved) {
+    // ─── ESCOLHE A MELHOR REGRA ─────────────────────────────────────────
+    if (candidateRules.length === 0) {
+      console.log(`[FlowZap Kanban]    ⚠️ Nenhuma regra correspondeu para "${sender}"`);
+      if (existingCards.length > 0) { saveData(); }
+      return;
+    }
+
+    // Ordena por prioridade decrescente
+    candidateRules.sort((a, b) => b.priority - a.priority);
+    const winner = candidateRules[0];
+    const matchedTargetColIdx = winner.colIdx;
+    const matchedRule = winner.rule;
+
+    console.log(`[FlowZap Kanban]    🏆 Regra vencedora: "${matchedRule.label}" → coluna "${winner.colName}" (prioridade ${winner.priority})`);
+
+    const targetColObj = _normCol(funil.colunas[matchedTargetColIdx]);
+    let addedOrMoved = false;
+
+    if (existingCards.length > 0) {
+      // MOVE: Transfere o contato para a nova coluna alvo
+      const cardToMove = existingCards[0];
+      const fromColIdx = cardToMove.coluna;
+      const fromColName = funil.colunas[fromColIdx]
+        ? (typeof funil.colunas[fromColIdx] === 'string' ? funil.colunas[fromColIdx] : funil.colunas[fromColIdx].nome)
+        : fromColIdx;
+
+      cardToMove.coluna = matchedTargetColIdx;
+      cardToMove.sidebarOrder = -1;
+      cardToMove.time = new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+      if (msgText) cardToMove.lastMsg = String(msgText).substring(0, 60);
+
+      console.log(`[FlowZap Kanban] ✨✨ MOVIDO: "${sender}" de "${fromColName}" → "${targetColObj.nome}" (Regra: ${matchedRule.label})`);
+      addedOrMoved = true;
+    } else {
+      // ADD: cria novo card na coluna alvo
+      _addToKanban(funil, sender, matchedTargetColIdx, targetColObj.nome, msgText);
+      console.log(`[FlowZap Kanban] ✨✨ ADICIONADO: "${sender}" → "${targetColObj.nome}" (Regra: ${matchedRule.label})`);
+      addedOrMoved = true;
+    }
+
+    console.log(`[FlowZap Kanban] ══════════════════════════════════════════`);
+
+    if (addedOrMoved || existingCards.length > 0) {
       saveData();
       const boardArea = document.getElementById('crm-kanban-board-area');
       if (boardArea) renderKanban(boardArea);
-    } else {
-      // Mesmo sem mover, salva as atualizações de lastMsg/unread/time
-      if (existingCards.length > 0) {
-        saveData();
-        const boardArea = document.getElementById('crm-kanban-board-area');
-        if (boardArea) renderKanban(boardArea);
-      }
     }
   }
 
@@ -3400,11 +4340,11 @@
 
     function handleAddedNode(node) {
       if (node.nodeType !== 1) return;
-      // Um envio pendente autêntico sempre chega com um sinal de "relógio"
       const isPendingSent = !!node.querySelector('[data-icon="msg-time"]');
+      const isOutgoingNode = node.classList?.contains('message-out') || !!node.querySelector?.('[class*="message-out"]');
 
-      // Bloqueia velhas msgs mas autoriza novas mensagens enviadas para processarem na hora!
-      if (!isPendingSent && Date.now() < botReadyAt) return;
+      // Bloqueia velhas msgs do histórico mas autoriza mensagens enviadas (message-out) ou pendentes
+      if (!isPendingSent && !isOutgoingNode && Date.now() < botReadyAt) return;
 
       const candidates = [];
       if (node.classList?.contains('message-in') || node.classList?.contains('message-out')) candidates.push(node);
@@ -3415,18 +4355,27 @@
         const isOutgoing = !isIncoming;
 
         // ID sem prefixo DOM_ para cruzar com o notification handler (mesmo msgId)
-        const dataId = msgEl.getAttribute('data-id');
+        const closestWithId = msgEl.closest('[data-id]');
+        const dataId = msgEl.getAttribute('data-id') || (closestWithId ? closestWithId.getAttribute('data-id') : null);
         const textSnippet = extractMessageText(msgEl).substring(0, 20);
         const msgId = dataId || (currentChatKey + '_' + textSnippet);
+
+        // Automação de Kanban: Dispara imediatamente para mensagens enviadas por você
+        const text = extractMessageText(msgEl);
+        if (currentChatKey && isOutgoing) {
+          if (!processedIds.has('SENT_' + msgId)) {
+            processedIds.add('SENT_' + msgId);
+            markMessageSent(currentChatKey, text);
+            tryAutoAddKanban(currentChatKey, text, 'message_sent');
+          }
+        }
 
         // Verifica se o notification handler já processou esta mensagem
         if (processedIds.has(msgId) || processedIds.has('NOTIF_' + msgId)) continue;
         processedIds.add(msgId);
 
-        // Automação de Kanban (Fallback)
-        const text = extractMessageText(msgEl);
-        if (currentChatKey) {
-          tryAutoAddKanban(currentChatKey, text, isIncoming ? 'new_message' : 'message_sent');
+        if (currentChatKey && isIncoming) {
+          tryAutoAddKanban(currentChatKey, text, 'new_message');
         }
 
         // ⛔ Ignora mensagens de mídia/documentos (PDF, áudio, imagem, etc.) para o Bot
@@ -3450,6 +4399,43 @@
       }
     }
 
+    function setupComposerSendListener() {
+      // Captura envio via tecla Enter no teclado (no editor de mensagem do WhatsApp Web)
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+          const footer = document.querySelector('#main footer');
+          if (footer && (footer.contains(e.target) || e.target.closest('#main footer'))) {
+            const chatKey = getStableChatKey();
+            const text = e.target.textContent || e.target.innerText || '';
+            if (chatKey) {
+              markMessageSent(chatKey, text);
+              console.log(`[FlowZap Bot] 📤 Envio detectado por tecla Enter no chat "${chatKey}": "${text.substring(0, 40)}"`);
+              setTimeout(() => {
+                tryAutoAddKanban(chatKey, text, 'message_sent');
+              }, 100);
+            }
+          }
+        }
+      }, true);
+
+      // Captura envio via clique no botão de enviar (ícone de avião de papel)
+      document.addEventListener('click', (e) => {
+        const sendBtn = e.target.closest?.('[data-testid="send"], [data-testid="compose-btn-send"], button[aria-label="Enviar"], span[data-icon="send"]');
+        if (sendBtn) {
+          const chatKey = getStableChatKey();
+          const box = document.querySelector('#main footer [contenteditable="true"], #main footer div[role="textbox"]');
+          const text = box ? (box.textContent || box.innerText || '') : '';
+          if (chatKey) {
+            markMessageSent(chatKey, text);
+            console.log(`[FlowZap Bot] 📤 Envio detectado por clique no botão de enviar no chat "${chatKey}": "${text.substring(0, 40)}"`);
+            setTimeout(() => {
+              tryAutoAddKanban(chatKey, text, 'message_sent');
+            }, 100);
+          }
+        }
+      }, true);
+    }
+
     function startDomObserver() {
       if (msgObserver) msgObserver.disconnect();
       const main = document.querySelector('#main');
@@ -3461,6 +4447,11 @@
     }
 
     function watchChatChanges() {
+      const header = document.querySelector('#main header');
+      if (!header) {
+        setTimeout(watchChatChanges, 1000);
+        return;
+      }
       const obs = new MutationObserver(() => {
         clearTimeout(changeDebounce);
         changeDebounce = setTimeout(() => {
@@ -3468,16 +4459,15 @@
           if (key && key !== currentChatKey) {
             currentChatKey = key;
             botReadyAt = Date.now() + GRACE_MS;
-            processedIds.clear();
-            console.log(`[FlowZap Bot] 🔄 Chat: "${key}"`);
+            console.log(`[FlowZap Bot] 🔄 Chat aberto alterado para: "${key}"`);
           }
-        }, 600);
+        }, 500);
       });
-      const target = document.querySelector('#main') || document.body;
-      obs.observe(target, { childList: true, subtree: true, attributes: true, attributeFilter: ['title'] });
+      obs.observe(header, { childList: true, subtree: true, characterData: true });
     }
 
     currentChatKey = getStableChatKey() || '';
+    setupComposerSendListener();
     startDomObserver();
     watchChatChanges();
   }
@@ -3497,6 +4487,8 @@
         const resBody = await req.json();
         if (resBody.success) {
           console.log(`[FlowZap Bot] ✨ Resposta Inteligente Enviada Silenciosamente via API Baileys para ${senderName}!`);
+          // Garante que o Kanban avance se houver regra de "Mensagem enviada por mim"
+          tryAutoAddKanban(senderName, responseText, 'message_sent');
           return; // Sucesso com a API, ignora totalmente a injeção em tela! (Não atrapalha o usuário)
         }
       } catch (e) {
@@ -3656,14 +4648,178 @@
         cache: 'no-store',
         body: bodyObj ? JSON.stringify(bodyObj) : null
       });
-      return await res.json();
+      const data = await res.json();
+      if (!res.ok) {
+        data.status = res.status;
+        data.isHttpError = true;
+        if (data.error === undefined || data.error === null) {
+          data.error = true;
+        }
+      }
+      return data;
     } catch (e) {
       console.error('[FlowZap HTTP Erro]', e);
       return { error: true, message: e.message };
     }
   }
 
+  function getAuthErrorMessage(data, defaultMsg = 'Erro na operação.') {
+    if (!data) return '❌ ' + defaultMsg;
+    if (data.status === 429 || data.code === 429 ||
+        (typeof data.msg === 'string' && data.msg.toLowerCase().includes('rate limit')) ||
+        (typeof data.error_description === 'string' && data.error_description.toLowerCase().includes('rate limit'))) {
+      return '⏱️ Muitas tentativas em pouco tempo. Aguarde cerca de 1 minuto antes de tentar novamente.';
+    }
+    
+    const rawErr = data.error_description || data.msg || data.message || (typeof data.error === 'string' ? data.error : null);
+    if (rawErr) {
+      const lower = rawErr.toLowerCase();
+      if (lower.includes('already') || lower.includes('registrado') || lower.includes('cadastrado')) {
+        return '⚠️ Este e-mail já está cadastrado. Clique em "Fazer Login".';
+      }
+      if (lower.includes('invalid login credentials') || lower.includes('invalid_grant')) {
+        return '❌ E-mail ou senha incorretos.';
+      }
+      if (lower.includes('email not confirmed') || lower.includes('confirm email') || lower.includes('email_not_confirmed')) {
+        return '📧 E-mail ainda não confirmado. Verifique sua caixa de entrada ou desative "Confirm email" no Supabase.';
+      }
+      if (lower.includes('password should be at least')) {
+        return '⚠️ A senha deve ter pelo menos 6 caracteres.';
+      }
+      return '❌ ' + rawErr;
+    }
+    return '❌ ' + defaultMsg;
+  }
+
+  function showResetPasswordScreen(recoveryToken) {
+    if (document.getElementById('crm-reset-blocker')) return;
+
+    const blocker = document.createElement('div');
+    blocker.id = 'crm-reset-blocker';
+    blocker.style.cssText = `
+      position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
+      background: rgba(17, 27, 33, 0.95); z-index: 99999999;
+      display: flex; align-items: center; justify-content: center;
+      font-family: system-ui, sans-serif;
+    `;
+
+    const box = document.createElement('div');
+    box.style.cssText = `
+      background: #202c33; border-radius: 12px; padding: 30px;
+      width: 350px; text-align: center; color: #fff;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.5); border: 1px solid #2a3942;
+    `;
+
+    box.innerHTML = `
+      <div style="font-size: 32px; margin-bottom: 15px;">🔑</div>
+      <h2 style="font-size: 20px; font-weight: 500; margin-bottom: 5px;">Redefinir Senha</h2>
+      <p style="font-size: 13px; color: #8696a0; margin-bottom: 20px;">Digite sua nova senha abaixo.</p>
+      
+      <div style="text-align: left; margin-bottom: 15px;">
+        <label style="display: block; font-size: 12px; color: #00a884; margin-bottom: 5px;">NOVA SENHA</label>
+        <input type="password" id="crm-reset-pass" placeholder="Nova senha (min. 6 caracteres)" style="width: 100%; padding: 10px; border-radius: 6px; border: 1px solid #2a3942; background: #111b21; color: #fff; outline: none; font-size: 14px;">
+      </div>
+
+      <div style="text-align: left; margin-bottom: 20px;">
+        <label style="display: block; font-size: 12px; color: #00a884; margin-bottom: 5px;">CONFIRMAR SENHA</label>
+        <input type="password" id="crm-reset-pass-confirm" placeholder="Confirme a nova senha" style="width: 100%; padding: 10px; border-radius: 6px; border: 1px solid #2a3942; background: #111b21; color: #fff; outline: none; font-size: 14px;">
+      </div>
+
+      <div id="crm-reset-err" style="color: #f15c6d; font-size: 13px; margin-bottom: 15px; min-height: 18px;"></div>
+      
+      <button id="crm-reset-save-btn" style="width: 100%; padding: 12px; border: none; border-radius: 20px; background: #00a884; color: #111b21; font-weight: bold; font-size: 14px; cursor: pointer; transition: 0.2s;">Salvar Nova Senha</button>
+    `;
+
+    blocker.appendChild(box);
+    document.body.appendChild(blocker);
+
+    const passEl = document.getElementById('crm-reset-pass');
+    const passConfirmEl = document.getElementById('crm-reset-pass-confirm');
+    const errEl = document.getElementById('crm-reset-err');
+    const saveBtn = document.getElementById('crm-reset-save-btn');
+
+    saveBtn.addEventListener('click', async () => {
+      const pass = passEl.value?.trim();
+      const passConfirm = passConfirmEl.value?.trim();
+
+      errEl.style.color = '#f15c6d';
+      if (!pass || !passConfirm) {
+        errEl.textContent = 'Preencha todos os campos';
+        return;
+      }
+      if (pass.length < 6) {
+        errEl.textContent = 'A senha deve ter no mínimo 6 caracteres';
+        return;
+      }
+      if (pass !== passConfirm) {
+        errEl.textContent = 'As senhas não coincidem';
+        return;
+      }
+
+      errEl.style.color = '#8696a0';
+      errEl.textContent = 'Atualizando senha...';
+      saveBtn.disabled = true;
+      saveBtn.style.opacity = '0.5';
+
+      try {
+        const updateRes = await apiSupabase('/auth/v1/user', 'PUT', { password: pass }, recoveryToken);
+        if (updateRes.error || updateRes.isHttpError || updateRes.status >= 400 || updateRes.code >= 400) {
+          errEl.style.color = '#f15c6d';
+          errEl.textContent = getAuthErrorMessage(updateRes, 'Erro ao redefinir a senha.');
+          saveBtn.disabled = false;
+          saveBtn.style.opacity = '1';
+        } else {
+          errEl.style.color = '#00a884';
+          errEl.textContent = '✅ Senha atualizada com sucesso!';
+          setTimeout(() => {
+            blocker.remove();
+            showLoginScreen('Senha alterada com sucesso! Faça login com a nova senha.');
+          }, 1500);
+        }
+      } catch (e) {
+        errEl.style.color = '#f15c6d';
+        errEl.textContent = 'Erro de conexão ao redefinir senha.';
+        saveBtn.disabled = false;
+        saveBtn.style.opacity = '1';
+      }
+    });
+  }
+
+  function performLogout(msg = 'Você saiu da sua conta.') {
+    chrome.storage.local.remove(['FlowZap_token', 'FlowZap_user_id', 'FlowZap_refresh_token'], () => {
+      if (typeof closeAll === 'function') closeAll();
+
+      document.getElementById('crm-sidebar-container')?.remove();
+      document.getElementById('crm-overlay')?.remove();
+      document.getElementById('crm-pending-blocker')?.remove();
+      document.getElementById('crm-checkout-blocker')?.remove();
+      document.getElementById('crm-login-blocker')?.remove();
+      document.querySelectorAll('.crm-panel, .crm-modal').forEach(el => el.remove());
+
+      document.querySelectorAll('div[style*="z-index: 9999"]').forEach(el => {
+        if (el.textContent && el.textContent.includes('FlowZap')) el.remove();
+      });
+
+      if (state) state.user = null;
+      showLoginScreen(msg);
+    });
+  }
+
   async function checkAuthAndInit() {
+    // Detecta token de recuperação de senha vindo do link do Supabase
+    if (window.location.hash) {
+      try {
+        const hashStr = window.location.hash.substring(1);
+        const params = new URLSearchParams(hashStr);
+        if (params.get('type') === 'recovery' && params.get('access_token')) {
+          const recToken = params.get('access_token');
+          window.history.replaceState({}, '', window.location.pathname + window.location.search);
+          showResetPasswordScreen(recToken);
+          return;
+        }
+      } catch (e) { }
+    }
+
     // Detecta e LIMPA o parâmetro de retorno do InfinityPay imediatamente
     const justPaidFromRedirect = window.location.search.includes('FlowZap_paid=true');
     if (justPaidFromRedirect) {
@@ -3874,9 +5030,7 @@
     // Botão de logout
     document.getElementById('crm-pending-logout')?.addEventListener('click', () => {
       if (pollInterval) clearInterval(pollInterval);
-      chrome.storage.local.remove(['FlowZap_token', 'FlowZap_user_id', 'FlowZap_refresh_token']);
-      blocker.remove();
-      showLoginScreen();
+      performLogout();
     });
   }
 
@@ -3910,7 +5064,10 @@
       </div>
       
       <div style="text-align: left; margin-bottom: 25px;">
-        <label style="display: block; font-size: 12px; color: #00a884; margin-bottom: 5px;">SENHA</label>
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
+          <label style="font-size: 12px; color: #00a884;">SENHA</label>
+          <a href="#" id="crm-forgot-pass-btn" style="font-size: 11px; color: #8696a0; text-decoration: none; transition: 0.2s;">Esqueceu a senha?</a>
+        </div>
         <input type="password" id="crm-login-pass" placeholder="Sua senha" style="width: 100%; padding: 10px; border-radius: 6px; border: 1px solid #2a3942; background: #111b21; color: #fff; outline: none; font-size: 14px;">
       </div>
 
@@ -3930,18 +5087,77 @@
     const emailEl = document.getElementById('crm-login-email');
     const passEl = document.getElementById('crm-login-pass');
     const errEl = document.getElementById('crm-login-err');
+    const loginBtn = document.getElementById('crm-login-btn');
+    const registerBtn = document.getElementById('crm-register-btn');
+    const forgotBtn = document.getElementById('crm-forgot-pass-btn');
+
+    function setAuthLoading(loading) {
+      if (loading) {
+        loginBtn.disabled = true;
+        registerBtn.disabled = true;
+        if (forgotBtn) forgotBtn.style.pointerEvents = 'none';
+        loginBtn.style.opacity = '0.5';
+        registerBtn.style.opacity = '0.5';
+        loginBtn.style.cursor = 'not-allowed';
+        registerBtn.style.cursor = 'not-allowed';
+      } else {
+        loginBtn.disabled = false;
+        registerBtn.disabled = false;
+        if (forgotBtn) forgotBtn.style.pointerEvents = 'auto';
+        loginBtn.style.opacity = '1';
+        registerBtn.style.opacity = '1';
+        loginBtn.style.cursor = 'pointer';
+        registerBtn.style.cursor = 'pointer';
+      }
+    }
+
+    // FORGOT PASSWORD
+    if (forgotBtn) {
+      forgotBtn.addEventListener('click', async (e) => {
+        e.preventDefault();
+        const email = emailEl.value?.trim();
+        if (!email) {
+          errEl.style.color = '#f15c6d';
+          errEl.textContent = 'Digite seu e-mail acima para recuperar a senha.';
+          emailEl.focus();
+          return;
+        }
+
+        errEl.style.color = '#8696a0';
+        errEl.textContent = 'Enviando e-mail de recuperação...';
+        setAuthLoading(true);
+        try {
+          const recoverData = await apiSupabase('/auth/v1/recover', 'POST', { email });
+          if (recoverData.error || recoverData.isHttpError || recoverData.status >= 400 || recoverData.code >= 400) {
+            errEl.style.color = '#f15c6d';
+            errEl.textContent = getAuthErrorMessage(recoverData, 'Erro ao solicitar recuperação de senha.');
+          } else {
+            errEl.style.color = '#00a884';
+            errEl.textContent = '📧 E-mail enviado! Verifique sua caixa de entrada e spam.';
+          }
+        } catch (err) {
+          errEl.style.color = '#f15c6d';
+          errEl.textContent = 'Erro de conexão ao solicitar recuperação.';
+        } finally {
+          setAuthLoading(false);
+        }
+      });
+    }
 
     // LOGIN
-    document.getElementById('crm-login-btn').addEventListener('click', async () => {
+    loginBtn.addEventListener('click', async () => {
       const email = emailEl.value?.trim();
       const pass = passEl.value?.trim();
+      errEl.style.color = '#f15c6d';
       if (!email || !pass) { errEl.textContent = 'Preencha todos os campos'; return; }
 
       errEl.textContent = 'Entrando...';
+      setAuthLoading(true);
       try {
         const loginData = await apiSupabase('/auth/v1/token?grant_type=password', 'POST', { email, password: pass });
-        if (loginData.error || !loginData.access_token) {
-          errEl.textContent = loginData.error_description || 'Senha incorreta ou conta ausente';
+        if (loginData.error || loginData.isHttpError || !loginData.access_token) {
+          errEl.textContent = getAuthErrorMessage(loginData, 'Senha incorreta ou conta ausente');
+          setAuthLoading(false);
           return;
         }
 
@@ -3953,20 +5169,26 @@
           blocker.remove();
           checkAuthAndInit(); // Reload logic to check trial or redirect to checkout
         });
-      } catch (e) { errEl.textContent = 'Erro de Rede.'; }
+      } catch (e) {
+        errEl.textContent = 'Erro de Rede.';
+        setAuthLoading(false);
+      }
     });
 
     // REGISTER
-    document.getElementById('crm-register-btn').addEventListener('click', async () => {
+    registerBtn.addEventListener('click', async () => {
       const email = emailEl.value?.trim();
       const pass = passEl.value?.trim();
+      errEl.style.color = '#f15c6d';
       if (!email || !pass) { errEl.textContent = 'Preencha todos os campos'; return; }
 
       errEl.textContent = 'Criando conta...';
+      setAuthLoading(true);
       try {
         const signUpData = await apiSupabase('/auth/v1/signup', 'POST', { email, password: pass });
-        if (signUpData.error) {
-          errEl.textContent = signUpData.msg || signUpData.error_description || 'Erro ao criar conta.' + (signUpData.error_description?.includes('already') ? ' E-mail já existe.' : '');
+        if (signUpData.error || signUpData.isHttpError || signUpData.status >= 400 || signUpData.code >= 400) {
+          errEl.textContent = getAuthErrorMessage(signUpData, 'Erro ao criar conta.');
+          setAuthLoading(false);
           return;
         }
 
@@ -3981,10 +5203,14 @@
             checkAuthAndInit(); // Reload pra ativar trial de 3 dias
           });
         } else {
-          errEl.textContent = 'Conta criada com sucesso! Você já pode fazer o Login.';
+          errEl.textContent = 'Conta criada! Clique em "Fazer Login" (ou confirme no e-mail se exigido pelo Supabase).';
           errEl.style.color = '#00a884';
+          setAuthLoading(false);
         }
-      } catch (e) { errEl.textContent = 'Erro de Rede.'; }
+      } catch (e) {
+        errEl.textContent = 'Erro de Rede.';
+        setAuthLoading(false);
+      }
     });
   }
 
@@ -4019,13 +5245,14 @@
          
          <div style="display:flex; align-items:center; justify-content:center; gap: 10px; margin-bottom: 15px;">
             <span style="font-size:28px; font-weight:bold; color:#00a884;">R$</span>
-            <span id="crm-checkout-val" style="font-size:38px; font-weight:bold; color:#fff;">20,00</span>
+            <span id="crm-checkout-val" style="font-size:38px; font-weight:bold; color:#fff;">10,00</span>
          </div>
          
-         <input type="range" id="crm-checkout-range" min="5" max="150" step="1" value="20" style="width: 100%; accent-color: #00a884; margin-bottom: 15px;">
+         <input type="range" id="crm-checkout-range" min="10" max="150" step="5" value="10" style="width: 100%; accent-color: #00a884; margin-bottom: 15px;">
          
-         <div id="crm-checkout-api-badge" style="font-size: 12px; padding: 6px; border-radius: 6px; background: rgba(255,255,255,0.05); color: #8696a0;">
-            <span style="color: #00a884;">Apenas CRM Padrão:</span> Acesso ao Funil, Etapas e Bots Locais.
+         <div id="crm-checkout-api-badge" style="font-size: 12px; padding: 10px; border-radius: 6px; background: rgba(255,255,255,0.05); color: #8696a0;">
+            <span style="color: #00a884; font-weight: bold;">Plano Padrão Selecionado:</span>
+            <div style="margin-top:5px; font-size:11px;">🤖 Dá direito a <b>4</b> disparos no Motor de Inteligência Artificial para resumo.</div>
             <div style="margin-top:5px; font-size:10px;">Dica: Pague R$ 50 ou mais para destravar a API Externa e N8N.</div>
          </div>
       </div>
@@ -4049,11 +5276,16 @@
       const v = parseInt(range.value, 10);
       valDisplay.textContent = v.toFixed(2).replace('.', ',');
 
+      const disparos = 4 + Math.floor((v - 10) / 5);
+
       if (v >= 50) {
-        apiBadge.innerHTML = `<span style="color: #00a884; font-weight:bold;">✨ API Externa + N8N!</span> O FlowZap trabalhará passivamente com ferramentas na nuvem respondendo Requisições HTTP em segundo plano.`;
+        apiBadge.innerHTML = `<span style="color: #00a884; font-weight:bold;">✨ API Externa + N8N Destravado!</span>
+            <div style="margin-top:5px; font-size:11px;">O FlowZap se conectará com a nuvem através de Webhooks!</div>
+            <div style="margin-top:5px; font-size:11px;">🤖 Direito incluído à <b>${disparos}</b> disparos de Inteligência Artificial!</div>`;
         apiBadge.style.background = 'rgba(0,168,132,0.1)';
       } else {
-        apiBadge.innerHTML = `<span style="color: #00a884;">Apenas CRM Padrão:</span> Acesso ao Funil, Etapas e Bots Locais.
+        apiBadge.innerHTML = `<span style="color: #00a884; font-weight:bold;">Plano Padrão:</span> Acesso ao Funil, Etapas e Bots Locais.
+            <div style="margin-top:5px; font-size:11px; color:white;">🤖 Direito incluído à <b>${disparos}</b> disparos de Inteligência Artificial!</div>
             <div style="margin-top:5px; font-size:10px;">Dica: Pague R$ 50 ou mais para destravar a API Externa e N8N.</div>`;
         apiBadge.style.background = 'rgba(255,255,255,0.05)';
       }
@@ -4061,9 +5293,7 @@
 
     document.getElementById('crm-logout-checkout').addEventListener('click', (e) => {
       e.preventDefault();
-      chrome.storage.local.remove(['FlowZap_token', 'FlowZap_user_id', 'FlowZap_refresh_token']);
-      blocker.remove();
-      showLoginScreen();
+      performLogout();
     });
 
     payBtn.addEventListener('click', async () => {
